@@ -392,7 +392,8 @@ def foreach_all_gather(
                 all_gather_input_numel,
                 rank,
             )
-            del param_all_gather_inputs    all_gather_stream.wait_stream(all_gather_copy_in_stream)
+            del param_all_gather_inputs
+    all_gather_stream.wait_stream(all_gather_copy_in_stream)
     with device_handle.stream(all_gather_stream):
         with dist.record_comm(_label_with_suffix("FSDP::all_gather", label_suffix)):
             all_gather_work = all_gather_comm(

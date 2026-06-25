@@ -6,7 +6,7 @@ import itertools
 import os
 import tempfile
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from unittest.mock import MagicMock
 
 import torch
