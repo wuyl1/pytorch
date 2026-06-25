@@ -24,6 +24,8 @@ class AllGatherResult(NamedTuple):
     all_gather_output: torch.Tensor
     all_gather_event: torch.Event | None
     all_gather_work: dist.distributed_c10d.Work | None
+    use_param_contiguous_output: bool
+    param_contiguous_metadata: object | None
     # For each parameter, the all-gather input dtype for each input
     param_all_gather_input_dtypes: list[list[torch.dtype]]
     # For each parameter, the all-gather input numel for each input
@@ -348,6 +350,27 @@ def foreach_all_gather(
             all_gather_inputs = [*chain.from_iterable(param_all_gather_inputs)]
         inp_split_sizes = [t.numel() for t in all_gather_inputs]
         all_gather_input_numel = sum(inp_split_sizes)
+        use_param_contiguous_output = (
+            all_gather_comm.supports_param_contiguous_output
+            and all_gather_comm.supports_no_copy
+            and _can_use_param_contiguous_output(
+                fsdp_params,
+                param_all_gather_input_dtypes,
+                param_all_gather_input_numels,
+                dtype,
+            )
+        )
+        param_contiguous_metadata = None
+        if use_param_contiguous_output:
+            param_contiguous_metadata = (
+                all_gather_comm.prepare_param_contiguous_output(
+                    inp_split_sizes,
+                    all_gather_input_numel,
+                    world_size,
+                    dtype,
+                    device,
+                )
+            )
         all_gather_output = all_gather_comm.allocate(
             (all_gather_input_numel * world_size,), dtype=dtype, device=device
         )
@@ -372,6 +395,8 @@ def foreach_all_gather(
             all_gather_output,
             all_gather_event,
             all_gather_work,
+            use_param_contiguous_output,
+            param_contiguous_metadata,
             param_all_gather_input_dtypes,
             param_all_gather_input_numels,
             inp_split_sizes,
@@ -437,6 +462,8 @@ def foreach_all_gather_copy_out(
         all_gather_output,
         all_gather_event,
         all_gather_work,
+        use_param_contiguous_output,
+        _param_contiguous_metadata,
         param_all_gather_input_dtypes,
         param_all_gather_input_numels,
         all_gather_input_split_sizes,
@@ -448,6 +475,14 @@ def foreach_all_gather_copy_out(
     if isinstance(all_gather_work, dist.distributed_c10d.Work):  # async op
         all_gather_work.wait()
     world_size, device = group.size(), all_gather_output.device
+    if use_param_contiguous_output and _try_use_param_contiguous_output(
+        all_gather_output,
+        fsdp_params,
+        param_all_gather_input_dtypes,
+        param_all_gather_input_numels,
+        world_size,
+    ):
+        return
 
     split_with_sizes_out: list[torch.Tensor] = []
     shard_i_copy_infos: list[tuple[FSDPParam, list[torch.Tensor]]] = []
@@ -516,6 +551,62 @@ def foreach_all_gather_copy_out(
                 post_param_size[shard_dim] *= world_size
                 cat_out = target_all_gather_output.view(post_param_size)
                 torch.cat(chunks, dim=shard_dim, out=cat_out)
+
+
+def _can_use_param_contiguous_output(
+    fsdp_params: list[FSDPParam],
+    param_all_gather_input_dtypes: list[list[torch.dtype]],
+    param_all_gather_input_numels: list[list[int]],
+    all_gather_output_dtype: torch.dtype,
+) -> bool:
+    if len(fsdp_params) != len(param_all_gather_input_numels):
+        return False
+
+    for fsdp_param, input_dtypes, input_numels in zip(
+        fsdp_params, param_all_gather_input_dtypes, param_all_gather_input_numels
+    ):
+        if (
+            len(input_dtypes) != 1
+            or len(input_numels) != 1
+            or input_dtypes[0] != all_gather_output_dtype
+            or fsdp_param.fsdp_placement.dim != 0
+            or fsdp_param.is_dtensor
+            or hasattr(fsdp_param._sharded_local_tensor, "fsdp_post_all_gather")
+        ):
+            return False
+    return True
+
+
+def _try_use_param_contiguous_output(
+    all_gather_output: torch.Tensor,
+    fsdp_params: list[FSDPParam],
+    param_all_gather_input_dtypes: list[list[torch.dtype]],
+    param_all_gather_input_numels: list[list[int]],
+    world_size: int,
+) -> bool:
+    if not _can_use_param_contiguous_output(
+        fsdp_params,
+        param_all_gather_input_dtypes,
+        param_all_gather_input_numels,
+        all_gather_output.dtype,
+    ):
+        return False
+
+    output_offset = 0
+    param_all_gather_outputs: list[tuple[FSDPParam, torch.Tensor]] = []
+    for fsdp_param, _input_dtypes, input_numels in zip(
+        fsdp_params, param_all_gather_input_dtypes, param_all_gather_input_numels
+    ):
+        output_numel = input_numels[0] * world_size
+        param_output = all_gather_output.narrow(0, output_offset, output_numel)
+        param_all_gather_outputs.append((fsdp_param, param_output))
+        output_offset += output_numel
+    if output_offset != all_gather_output.numel():
+        return False
+
+    for fsdp_param, param_output in param_all_gather_outputs:
+        fsdp_param.init_param_contiguous_all_gather_outputs(param_output)
+    return True
 
 
 @torch.no_grad()
