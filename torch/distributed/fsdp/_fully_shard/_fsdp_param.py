@@ -623,8 +623,12 @@ class FSDPParam:
             unsharded_tensor,
             self._orig_size,
             self._contiguous_orig_stride,
-            storage_offset=0,
+            storage_offset=unsharded_tensor.storage_offset(),
         )
+        if unsharded_param.data_ptr() != unsharded_tensor.data_ptr():
+            _raise_assert_with_print(
+                "FSDP unsharded parameter lost its all-gather output storage offset"
+            )
         if self._unsharded_dtensor_spec is not None:
             unsharded_param = _from_local_no_grad(
                 unsharded_param, self._unsharded_dtensor_spec
