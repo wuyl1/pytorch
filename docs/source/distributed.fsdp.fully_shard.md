@@ -163,43 +163,25 @@ Compared to PyTorch FSDP1 (`FullyShardedDataParallel`):
 
 ### Custom Collective Backends
 
-FSDP2 issues its all-gather and reduce-scatter through pluggable backends. By
-default it uses `DefaultAllGather` / `DefaultReduceScatter`, but you can
-override them per module with `FSDPModule.set_custom_all_gather` and
-`FSDPModule.set_custom_reduce_scatter` to control how and where communication
-buffers are allocated and which collective is invoked. See `Comm` for the
-interface a backend implements.
+Use `set_custom_all_gather` or `set_custom_reduce_scatter` to replace an
+FSDP module's collective backend:
 
-By default the all-gather output uses a rank-major (`[rank][param]`) layout and
-FSDP copies each parameter out into its own storage. A backend that can instead
-write a parameter-contiguous (`[param][rank]`) output may set `AllGather.layout`
-to an `AllGatherLayout` from
-`torch.distributed.fsdp._fully_shard._all_gather_layout`. Its `prepare_output`,
-`copy_in`, and `finalize_outputs` methods let the backend choose an input layout that
-matches its output layout and view each unsharded parameter directly on top of
-its output buffer, skipping the copy-out and its extra allocation. Because the
-unsharded parameters alias the backend output, this fast path follows a
-conservative eligibility policy and is
-only used when every parameter has a single dtype-preserving all-gather input,
-is sharded on dim-0, and uses no all-gather extension or DTensor
-post-processing. It also
-falls back to the rank-major copy-out under `torch.compile` / compiled autograd
-(the aliasing is not traceable today) and during a post-forward mesh reshard.
-FSDP passes this eligibility decision and the input metadata using public
-Python and PyTorch types, and layouts can use
-`AllGatherLayout.param_contiguous_output_views` to construct the parameter
-views without depending on FSDP internals. Without a layout,
-FSDP keeps the default copy-in and copy-out path. Returning `None` from
-`prepare_output` selects that path for the current collective, and the backend
-must produce rank-major output. Otherwise, FSDP carries the layout and metadata
-with the result and calls `finalize_outputs` after waiting for the
-collective.
+```python
+from my_backend import MyAllGather
+from torch.distributed.fsdp import fully_shard
 
-Metadata and aliased buffers must remain valid until their consumers finish
-using them. A backend that persistently reuses output storage must use a
-separate backend instance per FSDP parameter group; sharing that storage across
-overlapping groups is unsafe. FSDP does not free layout-owned storage, so a
-persistent output trades memory for allocation and registration performance.
+for module in [*model.layers, model]:
+    fully_shard(module)
+    module.set_custom_all_gather(MyAllGather())
+```
+
+An all-gather backend may set `AllGather.layout` to an `AllGatherLayout` to
+customize input packing and output views. Returning `None` from
+`prepare_output` uses the default rank-major copy path.
+
+Layout metadata and aliased buffers must remain valid while in use. A backend
+with persistent output storage must use a separate instance per parameter group;
+FSDP does not free layout-owned storage.
 
 ```{eval-rst}
 .. currentmodule:: torch.distributed.fsdp
