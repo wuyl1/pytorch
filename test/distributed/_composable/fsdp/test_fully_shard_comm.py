@@ -30,9 +30,9 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp._fully_shard._all_gather_layout import AllGatherLayout
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather
 from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
+    _can_use_param_contiguous_output,
     _div_if_needed,
     _get_gradient_divide_factors,
-    AllGatherResult,
     DefaultAllGather,
     DefaultReduceScatter,
     foreach_all_gather,
@@ -44,7 +44,7 @@ from torch.distributed.fsdp._fully_shard._fsdp_init import (
     _get_post_forward_mesh_info,
     _init_default_fully_shard_mesh,
 )
-from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam, ShardedState
+from torch.distributed.fsdp._fully_shard._fsdp_param import ShardedState
 from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.debug import CommDebugMode
@@ -135,24 +135,20 @@ class _ParamContiguousTestLayout(AllGatherLayout):
 
     def prepare_output(
         self,
-        all_gather_input_split_sizes: list[int],
-        all_gather_input_numel: int,
+        input_split_sizes: list[int],
+        input_numel: int,
         world_size: int,
         dtype: torch.dtype,
         device: torch.device,
-        fsdp_params: list[FSDPParam],
-        param_all_gather_input_dtypes: list[list[torch.dtype]],
-        param_all_gather_input_numels: list[list[int]],
+        param_input_dtypes: list[list[torch.dtype]],
+        param_input_numels: list[list[int]],
+        can_use_param_contiguous_output: bool,
+        owner_token: int,
     ) -> object | None:
         self.split_sizes = []
-        if not self.can_use_param_contiguous_output(
-            fsdp_params,
-            param_all_gather_input_dtypes,
-            param_all_gather_input_numels,
-            dtype,
-        ):
+        if not can_use_param_contiguous_output:
             return None
-        self.split_sizes = all_gather_input_split_sizes
+        self.split_sizes = input_split_sizes
         self.world_size = world_size
         return self.split_sizes
 
@@ -178,15 +174,13 @@ class _ParamContiguousTestLayout(AllGatherLayout):
 
     def finalize_outputs(
         self,
-        all_gather_result: AllGatherResult,
-        fsdp_params: list[FSDPParam],
-        group: dist.ProcessGroup,
-    ) -> None:
-        self.init_param_contiguous_outputs(
-            all_gather_result.all_gather_output,
-            fsdp_params,
-            all_gather_result.param_all_gather_input_numels,
-            group.size(),
+        all_gather_output: torch.Tensor,
+        param_input_numels: list[list[int]],
+        world_size: int,
+        output_metadata: object,
+    ) -> list[list[torch.Tensor]]:
+        return self.param_contiguous_output_views(
+            all_gather_output, param_input_numels, world_size
         )
 
 
@@ -2402,7 +2396,7 @@ class TestParamContiguousEligibility(TestCase):
         )
 
     def _can_use(self, param) -> bool:
-        return _ParamContiguousTestLayout().can_use_param_contiguous_output(
+        return _can_use_param_contiguous_output(
             [param], [[torch.float32]], [[8]], torch.float32
         )
 
@@ -2424,7 +2418,7 @@ class TestParamContiguousEligibility(TestCase):
             )
         )
         self.assertFalse(
-            _ParamContiguousTestLayout().can_use_param_contiguous_output(
+            _can_use_param_contiguous_output(
                 [self._make_param()], [[torch.bfloat16]], [[8]], torch.float32
             )
         )

@@ -185,14 +185,21 @@ is sharded on dim-0, and uses no all-gather extension or DTensor
 post-processing. It also
 falls back to the rank-major copy-out under `torch.compile` / compiled autograd
 (the aliasing is not traceable today) and during a post-forward mesh reshard.
-Layouts can use `AllGatherLayout.can_use_param_contiguous_output` and
-`AllGatherLayout.init_param_contiguous_outputs` to apply this policy and
-initialize the parameter views. Without a layout, FSDP keeps the default
-copy-in and copy-out path. Returning `None` from `prepare_output` selects that
-path for the current collective, and the backend must produce rank-major output.
-Otherwise, FSDP carries the layout and its metadata with the result and calls
-`finalize_outputs` after waiting for the collective. Metadata and aliased buffers
-must remain valid until their consumers finish using them.
+FSDP passes this eligibility decision and the input metadata using public
+Python and PyTorch types, and layouts can use
+`AllGatherLayout.param_contiguous_output_views` to construct the parameter
+views without depending on FSDP internals. Without a layout,
+FSDP keeps the default copy-in and copy-out path. Returning `None` from
+`prepare_output` selects that path for the current collective, and the backend
+must produce rank-major output. Otherwise, FSDP carries the layout and metadata
+with the result and calls `finalize_outputs` after waiting for the
+collective.
+
+Metadata and aliased buffers must remain valid until their consumers finish
+using them. A backend that persistently reuses output storage must use a
+separate backend instance per FSDP parameter group; sharing that storage across
+overlapping groups is unsafe. FSDP does not free layout-owned storage, so a
+persistent output trades memory for allocation and registration performance.
 
 ```{eval-rst}
 .. currentmodule:: torch.distributed.fsdp
