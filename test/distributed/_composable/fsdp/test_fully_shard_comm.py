@@ -27,10 +27,12 @@ from torch.distributed.fsdp import (
     MixedPrecisionPolicy,
     OffloadPolicy,
 )
-from torch.distributed.fsdp._fully_shard._all_gather_layout import AllGatherLayout
+from torch.distributed.fsdp._fully_shard._all_gather_layout import (
+    _can_use_param_contiguous_output,
+    AllGatherLayout,
+)
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather
 from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
-    _can_use_param_contiguous_output,
     _div_if_needed,
     _get_gradient_divide_factors,
     DefaultAllGather,

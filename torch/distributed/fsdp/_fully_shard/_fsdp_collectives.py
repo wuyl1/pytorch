@@ -11,6 +11,7 @@ from torch.distributed.distributed_c10d import ReduceOp
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather, ReduceScatter
 from torch.distributed.tensor import DTensor
 
+from ._all_gather_layout import _can_use_param_contiguous_output, _init_layout_outputs
 from ._fsdp_api import _ReduceOp
 from ._fsdp_common import (
     _get_dim0_padded_size,
@@ -555,62 +556,6 @@ def foreach_all_gather_copy_out(
                 post_param_size[shard_dim] *= world_size
                 cat_out = target_all_gather_output.view(post_param_size)
                 torch.cat(chunks, dim=shard_dim, out=cat_out)
-
-
-def _can_use_param_contiguous_output(
-    fsdp_params: list[FSDPParam],
-    param_input_dtypes: list[list[torch.dtype]],
-    param_input_numels: list[list[int]],
-    output_dtype: torch.dtype,
-) -> bool:
-    if _compile_active():
-        return False
-    if not (len(fsdp_params) == len(param_input_dtypes) == len(param_input_numels)):
-        return False
-    for fsdp_param, input_dtypes, input_numels in zip(
-        fsdp_params, param_input_dtypes, param_input_numels
-    ):
-        if (
-            len(input_dtypes) != 1
-            or len(input_numels) != 1
-            or input_dtypes[0] != output_dtype
-            or fsdp_param.fsdp_placement.dim != 0
-            or fsdp_param.is_dtensor
-            or hasattr(fsdp_param._sharded_local_tensor, "fsdp_pre_all_gather")
-            or hasattr(fsdp_param._sharded_local_tensor, "fsdp_post_all_gather")
-            or fsdp_param.sharded_state == ShardedState.SHARDED_POST_FORWARD
-        ):
-            return False
-    return True
-
-
-def _compile_active() -> bool:
-    if torch.compiler.is_compiling():
-        return True
-    from torch._dynamo.compiled_autograd import compiled_autograd_enabled
-
-    return compiled_autograd_enabled
-
-
-def _init_layout_outputs(
-    fsdp_params: list[FSDPParam],
-    param_outputs: list[list[torch.Tensor]],
-) -> None:
-    if len(fsdp_params) != len(param_outputs):
-        raise AssertionError(
-            f"all-gather layout returned {len(param_outputs)} parameter outputs "
-            f"for {len(fsdp_params)} parameters"
-        )
-    for fsdp_param, outputs in zip(fsdp_params, param_outputs):
-        if not outputs:
-            raise AssertionError("all-gather layout returned no output for a parameter")
-        if (
-            hasattr(fsdp_param, "_unsharded_param")
-            and fsdp_param._unsharded_param.data_ptr() != outputs[0].data_ptr()
-        ):
-            del fsdp_param._unsharded_param
-        fsdp_param.all_gather_outputs = outputs
-        fsdp_param._keep_all_gather_output_storage = True
 
 
 @torch.no_grad()
