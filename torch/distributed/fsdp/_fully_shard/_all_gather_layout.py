@@ -1,10 +1,16 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial
+from typing import TYPE_CHECKING
 
 import torch
 
-from ._fsdp_param import FSDPParam, ShardedState
+
+if TYPE_CHECKING:
+    from ._fsdp_param import FSDPParam
 
 
 AllGatherCopyIn = Callable[
@@ -13,8 +19,41 @@ AllGatherCopyIn = Callable[
 ]
 
 
+@dataclass
+class AllGatherParamMetadata:
+    """Tensor-only description of one parameter's collective outputs.
+
+    ``outputs`` contains the existing destinations, if any. Their storage and
+    tensor identities must survive while autograd can hold saved aliases.
+    ``padded_sharded_size`` describes this call's shard before all-gather.
+    """
+
+    input_numels: list[int]
+    input_dtypes: list[torch.dtype]
+    shard_dim: int
+    padded_sharded_size: torch.Size
+    outputs: list[torch.Tensor]
+    backend_owned: bool
+
+
+@dataclass
+class AllGatherOutputs:
+    """Outputs and whether FSDP must leave their storage to the backend.
+
+    Backend-owned storage must remain valid, including across reshard, until
+    the parameter group is destroyed. This contract does not recycle buffers.
+    """
+
+    tensors: list[list[torch.Tensor]]
+    backend_owned: bool = False
+
+
 class AllGatherLayout(ABC):
-    """Optional input packing and output layout for an all-gather backend."""
+    """Input packing and output handling for an all-gather backend.
+
+    FSDP orders collective completion before finalization. The backend owns
+    communication stream lifetimes and any persistent registered storage.
+    """
 
     _owner: object | None = None
 
@@ -37,7 +76,7 @@ class AllGatherLayout(ABC):
         param_input_dtypes: list[list[torch.dtype]],
         param_input_numels: list[list[int]],
         can_use_param_contiguous_output: bool,
-    ) -> tuple[AllGatherCopyIn, object | None]:
+    ) -> tuple[AllGatherCopyIn, AllGatherLayout, object | None]:
         """Select input packing and metadata before allocating the output."""
         metadata = self.prepare_output(
             input_split_sizes,
@@ -50,8 +89,8 @@ class AllGatherLayout(ABC):
             can_use_param_contiguous_output,
         )
         if metadata is None:
-            return torch.ops.fsdp.all_gather_copy_in, None
-        return partial(self.copy_in, output_metadata=metadata), metadata
+            return torch.ops.fsdp.all_gather_copy_in, DEFAULT_ALL_GATHER_LAYOUT, None
+        return partial(self.copy_in, output_metadata=metadata), self, metadata
 
     @abstractmethod
     def prepare_output(
@@ -94,11 +133,15 @@ class AllGatherLayout(ABC):
     def finalize_outputs(
         self,
         all_gather_output: torch.Tensor,
-        param_input_numels: list[list[int]],
+        param_metadata: list[AllGatherParamMetadata],
         world_size: int,
-        output_metadata: object,
-    ) -> list[list[torch.Tensor]]:
-        """Return the per-parameter outputs after collective completion."""
+        output_metadata: object | None,
+    ) -> AllGatherOutputs:
+        """Copy or view outputs after collective completion on the compute stream.
+
+        Existing parameter storage is preserved by FSDP when returned views
+        differ from it. Such calls use copy-out instead of replacing aliases.
+        """
         ...
 
     def param_contiguous_output_views(
@@ -123,12 +166,98 @@ class AllGatherLayout(ABC):
         return outputs
 
 
+class DefaultAllGatherLayout(AllGatherLayout):
+    """Rank-major collective output copied into stable parameter storage."""
+
+    def _bind_owner(self, owner: object) -> None:
+        # Stateless layouts may be shared by existing collective backends.
+        pass
+
+    def prepare(
+        self, *args: object, **kwargs: object
+    ) -> tuple[AllGatherCopyIn, AllGatherLayout, object | None]:
+        return torch.ops.fsdp.all_gather_copy_in, self, None
+
+    def prepare_output(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    def finalize_outputs(
+        self,
+        all_gather_output: torch.Tensor,
+        param_metadata: list[AllGatherParamMetadata],
+        world_size: int,
+        output_metadata: object | None,
+    ) -> AllGatherOutputs:
+        from ._fsdp_collectives import _copy_all_gather_outputs
+        from ._fsdp_param import alloc_storage
+
+        outputs = []
+        copy_outputs = []
+        reorder_infos = []
+        split_sizes = []
+        for param in param_metadata:
+            param_outputs = param.outputs or [
+                torch.empty(
+                    numel * world_size, dtype=dtype, device=all_gather_output.device
+                )
+                for numel, dtype in zip(param.input_numels, param.input_dtypes)
+            ]
+            if not param.backend_owned:
+                for tensor in param_outputs:
+                    alloc_storage(tensor)
+            outputs.append(param_outputs)
+            split_sizes.extend(
+                numel * tensor.element_size() // all_gather_output.element_size()
+                for numel, tensor in zip(param.input_numels, param_outputs)
+            )
+            if param.shard_dim != 0:
+                temporary_outputs = [torch.empty_like(t) for t in param_outputs]
+                reorder_infos.append((param, temporary_outputs, param_outputs))
+                copy_outputs.extend(temporary_outputs)
+            else:
+                copy_outputs.extend(param_outputs)
+
+        # Fallback may receive the same persistent buffer that parameters alias.
+        if any(
+            param.backend_owned
+            and any(
+                tensor.untyped_storage().data_ptr()
+                == all_gather_output.untyped_storage().data_ptr()
+                for tensor in param.outputs
+            )
+            for param in param_metadata
+        ):
+            all_gather_output = all_gather_output.clone()
+        _copy_all_gather_outputs(
+            all_gather_output, split_sizes, copy_outputs, world_size
+        )
+        for param, temporary_outputs, param_outputs in reorder_infos:
+            pre_param_size = list(param.padded_sharded_size)
+            pre_param_size[0] *= world_size
+            post_param_size = list(param.padded_sharded_size)
+            post_param_size[param.shard_dim] *= world_size
+            with torch.autograd._unsafe_preserve_version_counter(
+                tuple(t for t in param_outputs if not t.is_inference())
+            ):
+                for source, target in zip(temporary_outputs, param_outputs):
+                    chunks = torch.chunk(source.view(pre_param_size), world_size, dim=0)
+                    torch.cat(
+                        chunks, dim=param.shard_dim, out=target.view(post_param_size)
+                    )
+        return AllGatherOutputs(outputs)
+
+
+DEFAULT_ALL_GATHER_LAYOUT = DefaultAllGatherLayout()
+
+
 def _can_use_param_contiguous_output(
     fsdp_params: list[FSDPParam],
     param_input_dtypes: list[list[torch.dtype]],
     param_input_numels: list[list[int]],
     output_dtype: torch.dtype,
 ) -> bool:
+    from ._fsdp_param import ShardedState
+
     if _compile_active():
         return False
     if not (len(fsdp_params) == len(param_input_dtypes) == len(param_input_numels)):
@@ -160,20 +289,36 @@ def _compile_active() -> bool:
 
 def _init_layout_outputs(
     fsdp_params: list[FSDPParam],
-    param_outputs: list[list[torch.Tensor]],
+    result: AllGatherOutputs,
 ) -> None:
-    if len(fsdp_params) != len(param_outputs):
+    from ._fsdp_param import alloc_storage
+
+    if len(fsdp_params) != len(result.tensors):
         raise AssertionError(
-            f"all-gather layout returned {len(param_outputs)} parameter outputs "
+            f"all-gather layout returned {len(result.tensors)} parameter outputs "
             f"for {len(fsdp_params)} parameters"
         )
-    for fsdp_param, outputs in zip(fsdp_params, param_outputs):
+    for fsdp_param, outputs in zip(fsdp_params, result.tensors):
         if not outputs:
             raise AssertionError("all-gather layout returned no output for a parameter")
-        if (
-            hasattr(fsdp_param, "_unsharded_param")
-            and fsdp_param._unsharded_param.data_ptr() != outputs[0].data_ptr()
-        ):
-            del fsdp_param._unsharded_param
-        fsdp_param.all_gather_outputs = outputs
-        fsdp_param._keep_all_gather_output_storage = True
+        previous = fsdp_param.all_gather_outputs
+        if not previous:
+            fsdp_param.all_gather_outputs = outputs
+            fsdp_param._keep_all_gather_output_storage = result.backend_owned
+        elif outputs is not previous:
+            if len(previous) != len(outputs):
+                raise AssertionError("all-gather layout changed the number of outputs")
+            # Saved tensors may alias this storage even after reshard. Preserve
+            # it when switching layouts or receiving a new backend buffer.
+            for target, source in zip(previous, outputs):
+                if target.shape != source.shape or target.dtype != source.dtype:
+                    raise AssertionError(
+                        "all-gather layout changed output shape or dtype"
+                    )
+                if not fsdp_param._keep_all_gather_output_storage:
+                    alloc_storage(target)
+                if target.data_ptr() != source.data_ptr():
+                    with torch.autograd._unsafe_preserve_version_counter(
+                        () if target.is_inference() else (target,)
+                    ):
+                        target.copy_(source)

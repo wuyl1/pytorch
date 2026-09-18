@@ -260,9 +260,9 @@ class FSDPParamGroup:
         # the group's post-backward (e.g. reduce-scatter, all-reduce and div), which
         # should be waited on at the end of backward
         self._post_reduce_event: torch.Event | None = None
-        # Holds the reshard-after-forward CUDA event when resharding to a
-        # different world size, which should be waited on in the next unshard
-        self._reshard_after_forward_event: torch.Event | None = None
+        # Orders the next all-gather after post-forward shard creation or the
+        # last compute use of persistent all-gather output storage.
+        self._reshard_event: torch.Event | None = None
 
         # Only for HSDP, if accumulating gradients without all-reduce, save the
         # partial reduce output (only reduce-scattered but not all-reduced)
@@ -395,11 +395,11 @@ class FSDPParamGroup:
             and self._training_state == TrainingState.PRE_BACKWARD
         ):
             return
-        if self._reshard_after_forward_event is not None:
-            # Resharded parameter data is allocated in the default stream and
-            # used in the all-gather streams
-            self._wait_all_gather_streams_on_event(self._reshard_after_forward_event)
-            self._reshard_after_forward_event = None
+        if self._reshard_event is not None:
+            # Order shard reads and persistent-output writes after reshard.
+            self._wait_all_gather_streams_on_event(self._reshard_event)
+            self.device_handle.current_stream().wait_event(self._reshard_event)
+            self._reshard_event = None
 
         if isinstance(self.mesh_info, FSDPMeshInfo):
             world_size = self._all_gather_process_group.size()
@@ -523,11 +523,18 @@ class FSDPParamGroup:
                 return
             if self._use_post_forward_mesh:
                 self._to_sharded_post_forward()
-                self._reshard_after_forward_event = self.device_handle.Event()
-                if self._reshard_after_forward_event is not None:
-                    self._reshard_after_forward_event.record()
+                self._reshard_event = self.device_handle.Event()
+                if self._reshard_event is not None:
+                    self._reshard_event.record()
                 return
         self._to_sharded()
+
+        if self._all_gather_comm.reuses_output_storage or any(
+            param._keep_all_gather_output_storage for param in self.fsdp_params
+        ):
+            # The next collective may overwrite storage still read by compute.
+            self._reshard_event = self.device_handle.Event()
+            self._reshard_event.record()
 
     def _reset_iter_state(self) -> None:
         # See FSDPState._reset_iter_state for semantics. Waits on any
@@ -550,9 +557,9 @@ class FSDPParamGroup:
         ):
             current_stream.wait_event(self._all_reduce_state.event)
         self._all_reduce_state = None
-        if self._reshard_after_forward_event is not None:
-            self._wait_all_gather_streams_on_event(self._reshard_after_forward_event)
-            self._reshard_after_forward_event = None
+        if self._reshard_event is not None:
+            self._wait_all_gather_streams_on_event(self._reshard_event)
+            self._reshard_event = None
         self._partial_reduce_output = None
         self._post_forward_indices.clear()
         self._training_state = TrainingState.IDLE
@@ -647,7 +654,7 @@ class FSDPParamGroup:
                 unsharded_grads: list[torch.Tensor] = []
 
                 for fsdp_param in self.fsdp_params:
-                    if not hasattr(fsdp_param, "_unsharded_param"):
+                    if fsdp_param._unsharded_param is None:
                         continue
                     # May have an accumulated gradient of the reduce dtype if the
                     # previous backward did not reduce-scatter

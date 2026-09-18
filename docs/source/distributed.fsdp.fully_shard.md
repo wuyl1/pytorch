@@ -175,13 +175,33 @@ for module in [*model.layers, model]:
     module.set_custom_all_gather(MyAllGather())
 ```
 
-An all-gather backend may set `AllGather.layout` to an `AllGatherLayout` to
-customize input packing and output views. Returning `None` from
-`prepare_output` uses the default rank-major copy path.
+Every all-gather backend has an `AllGather.layout`. The default
+`DefaultAllGatherLayout` implements rank-major copy-in and copy-out. Custom
+layouts override input packing and output handling. Returning `None` from
+`prepare_output` selects the default layout for that call, including its
+output finalizer.
 
-Layout metadata and aliased buffers must remain valid while in use. A backend
-with a layout must use a separate instance per parameter group. FSDP does not
-free layout-owned storage.
+`finalize_outputs` receives tensors and per-parameter dtype, size, and shard
+metadata through `AllGatherParamMetadata`; it does not receive FSDP internals.
+It returns `AllGatherOutputs`, which specifies the output tensors and their
+storage ownership. It runs on the compute stream after collective completion.
+The backend must track input, output, and metadata use on communication streams.
+Backends whose allocator reuses output storage must set
+`AllGather.reuses_output_storage=True`. FSDP then orders the next all-gather
+after the previous consumers, including for rank-major copy-out.
+
+A stateful layout must use a separate instance per parameter group. For
+`backend_owned=True`, the backend must keep the output storage valid for the
+parameter group's lifetime. FSDP does not resize or recycle that storage on
+reshard. Thus, a persistent-buffer backend keeps a full all-gather output per
+group resident even after backward. This trades memory for buffer reuse and
+does not provide the memory saving of the default FSDP output path. It also
+does not imply `reshard_after_forward=False`: logical reshard and the next
+all-gather still follow the configured FSDP policy.
+
+Once initialized, parameters and saved autograd views retain their storage.
+If a later call changes layout or returns different storage, FSDP copies into
+the existing destinations. Zero-copy therefore requires stable output views.
 
 ```{eval-rst}
 .. currentmodule:: torch.distributed.fsdp

@@ -557,8 +557,8 @@ class FSDPModule:
         See `Comm` and `ReduceScatter` for details.
 
         A backend can set ``AllGather.layout`` to customize input packing and
-        per-parameter output views. Without a layout, FSDP uses the default
-        rank-major copy-in and copy-out.
+        per-parameter output handling. The default layout uses rank-major
+        copy-in and copy-out.
 
         Args:
             comm (AllGather): Custom all-gather communication.
@@ -571,8 +571,7 @@ class FSDPModule:
                 "The custom comm would be ambiguous across groups with different meshes."
             )
         for fsdp_param_group in state._fsdp_param_groups:
-            if comm.layout is not None:
-                comm.layout._bind_owner(fsdp_param_group)
+            comm.layout._bind_owner(fsdp_param_group)
             fsdp_param_group._all_gather_comm = comm
 
     def set_custom_reduce_scatter(self, comm: ReduceScatter) -> None:
@@ -695,9 +694,14 @@ class FSDPModule:
         per-parameter input dtypes and element counts, and packed split sizes.
         Split sizes are in collective-buffer elements, or bytes for mixed dtypes.
         It prepares parameter inputs, allocates the output through
-        ``all_gather_comm.allocate``, and packs the input as a view into that
-        output's storage so FSDP retains it through collective completion.
-        The default output callback expects the existing rank-major layout.
+        ``all_gather_comm.allocate``, and packs the input. FSDP retains both
+        input and output tensors through collective completion; their storage
+        need not alias. The callback must order any external allocations on the
+        copy-in stream and preserve version counters when writing saved aliases.
+        ``AllGatherInput.layout`` and ``output_metadata`` describe the selected
+        output layout. They default to rank-major; the default output callback
+        dispatches through that layout. Delegating to the default input function
+        preserves the collective backend's layout selection, including fallback.
 
         The function runs without gradient tracking on the all-gather copy-in
         stream. FSDP manages stream dependencies, communication, and output
@@ -732,7 +736,10 @@ class FSDPModule:
         ``all_gather_outputs`` and owns copying and any reordering into them,
         preserving their dtype, device, and version counters. It runs on the
         current compute stream after FSDP waits for the collective to complete.
-        Reduce-scatter input preparation is unaffected.
+        Custom output callbacks require a rank-major collective result and
+        FSDP-owned parameter output storage. For custom layouts or backend-owned
+        outputs, keep the default callback, which invokes the selected layout's
+        finalizer. Reduce-scatter input preparation is unaffected.
 
         Args:
             fn (Callable): Function that initializes and copies all-gather outputs.

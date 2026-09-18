@@ -6,6 +6,7 @@ import itertools
 import os
 import tempfile
 import unittest
+import weakref
 from collections.abc import Callable, Sequence
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -29,12 +30,21 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp._fully_shard._all_gather_layout import (
     _can_use_param_contiguous_output,
+    _init_layout_outputs,
     AllGatherLayout,
+    AllGatherOutputs,
+    AllGatherParamMetadata,
+    DEFAULT_ALL_GATHER_LAYOUT,
+    DefaultAllGatherLayout,
 )
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather
 from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
+    _default_all_gather_input_fn,
+    _default_all_gather_output_fn,
     _div_if_needed,
     _get_gradient_divide_factors,
+    AllGatherInput,
+    AllGatherResult,
     DefaultAllGather,
     DefaultReduceScatter,
     foreach_all_gather,
@@ -46,8 +56,11 @@ from torch.distributed.fsdp._fully_shard._fsdp_init import (
     _get_post_forward_mesh_info,
     _init_default_fully_shard_mesh,
 )
-from torch.distributed.fsdp._fully_shard._fsdp_param import ShardedState
+from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam, ShardedState
 from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+from torch.distributed.fsdp.experimental import (
+    all_gather_output_fn_for_nonzero_dim_shards,
+)
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.debug import CommDebugMode
 from torch.distributed.tensor.experimental import implicit_replication
@@ -176,12 +189,17 @@ class _ParamContiguousTestLayout(AllGatherLayout):
     def finalize_outputs(
         self,
         all_gather_output: torch.Tensor,
-        param_input_numels: list[list[int]],
+        param_metadata: list[AllGatherParamMetadata],
         world_size: int,
-        output_metadata: object,
-    ) -> list[list[torch.Tensor]]:
-        return self.param_contiguous_output_views(
-            all_gather_output, param_input_numels, world_size
+        output_metadata: object | None,
+    ) -> AllGatherOutputs:
+        return AllGatherOutputs(
+            self.param_contiguous_output_views(
+                all_gather_output,
+                [param.input_numels for param in param_metadata],
+                world_size,
+            ),
+            backend_owned=True,
         )
 
 
@@ -409,21 +427,27 @@ class TestFullyShardCollectiveOps(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_custom_all_gather_zero_copy_then_fallback(self):
-        # After a zero-copy all-gather, a later all-gather that falls back to the
-        # default copy-out must drop the stale backend-owned output.
+        # Fallback must preserve the parameter and aliases saved by forward.
         param_sizes = [torch.Size([self.world_size, 2]), torch.Size([self.world_size])]
         orig_params = self._init_params(param_sizes)
         fsdp_param_group = self._init_fsdp_param_group(orig_params, True)
         comm = _ZeroCopyThenFallbackAllGather()
         self._run_custom_all_gather(comm, fsdp_param_group, orig_params)
         backend_storage_ptr = comm.outputs[-1].untyped_storage().data_ptr()
+        forward_params = [p._unsharded_param for p in fsdp_param_group.fsdp_params]
+        loss = sum(p.square().sum() for p in forward_params)
         for fsdp_param in fsdp_param_group.fsdp_params:
             self.assertTrue(fsdp_param._keep_all_gather_output_storage)
         fsdp_param_group._to_sharded()
         self._run_custom_all_gather(comm, fsdp_param_group, orig_params)
-        for fsdp_param in fsdp_param_group.fsdp_params:
-            self.assertFalse(fsdp_param._keep_all_gather_output_storage)
-            self.assertNotEqual(
+        loss.backward()
+        for fsdp_param, forward_param, orig_param in zip(
+            fsdp_param_group.fsdp_params, forward_params, orig_params
+        ):
+            self.assertTrue(fsdp_param._keep_all_gather_output_storage)
+            self.assertIs(fsdp_param._unsharded_param, forward_param)
+            self.assertEqual(forward_param.grad, 2 * orig_param)
+            self.assertEqual(
                 fsdp_param.all_gather_outputs[0].untyped_storage().data_ptr(),
                 backend_storage_ptr,
             )
@@ -2373,6 +2397,371 @@ class TestFullyShardReduceOpWorldSize1(FSDPTest):
             all_reduce_op,
         ) = _get_gradient_divide_factors(group, None, torch.float32)
         self.assertEqual(all_reduce_op, ReduceOp.SUM)
+
+
+@instantiate_parametrized_tests
+class TestAllGatherLayouts(TestCase):
+    def test_default_layout_is_shareable(self):
+        layout = DefaultAllGatherLayout()
+        layout._bind_owner(object())
+        layout._bind_owner(object())
+        self.assertIs(DefaultAllGather().layout, DEFAULT_ALL_GATHER_LAYOUT)
+
+    def test_default_layout_skips_param_contiguous_eligibility(self):
+        comm = MagicMock(spec=AllGather)
+        comm.layout = DEFAULT_ALL_GATHER_LAYOUT
+        comm.allocate.return_value = torch.empty(4)
+        group = MagicMock()
+        group.size.return_value = 2
+        group.rank.return_value = 0
+        with (
+            patch(
+                "torch.distributed.fsdp._fully_shard._fsdp_collectives._get_param_all_gather_inputs",
+                return_value=[[torch.arange(2.0)]],
+            ),
+            patch(
+                "torch.distributed.fsdp._fully_shard._fsdp_collectives._can_use_param_contiguous_output",
+                side_effect=AssertionError("default layout evaluated eligibility"),
+            ),
+        ):
+            result = _default_all_gather_input_fn(
+                [MagicMock()], group, torch.device("cpu"), comm
+            )
+        self.assertIs(result.layout, DEFAULT_ALL_GATHER_LAYOUT)
+
+    @parametrize("backend_owned", [False, True])
+    @parametrize("reuses_output", [False, True])
+    def test_reshard_orders_persistent_output_reuse(self, backend_owned, reuses_output):
+        group = FSDPParamGroup.__new__(FSDPParamGroup)
+        group._training_state = TrainingState.POST_BACKWARD
+        group._all_gather_comm = SimpleNamespace(reuses_output_storage=reuses_output)
+        group.fsdp_params = [
+            SimpleNamespace(_keep_all_gather_output_storage=backend_owned)
+        ]
+        group.device_handle = MagicMock()
+        group._to_sharded = MagicMock()
+        group._reshard_event = None
+        group.reshard()
+        group._to_sharded.assert_called_once()
+        if backend_owned or reuses_output:
+            group.device_handle.Event.assert_called_once()
+            group._reshard_event.record.assert_called_once()
+            event = group._reshard_event
+            group._all_gather_result = None
+            group._sharded_state = ShardedState.SHARDED
+            group.unshard_in_backward = True
+            group.mesh_info = object()
+            group._all_gather_output = torch.empty(0)
+            group.comm_ctx = SimpleNamespace(
+                all_gather_copy_in_stream=MagicMock(), all_gather_stream=MagicMock()
+            )
+            group.unshard()
+            group.comm_ctx.all_gather_copy_in_stream.wait_event.assert_called_once_with(
+                event
+            )
+            group.comm_ctx.all_gather_stream.wait_event.assert_called_once_with(event)
+            group.device_handle.current_stream().wait_event.assert_called_once_with(
+                event
+            )
+            self.assertIsNone(group._reshard_event)
+        else:
+            group.device_handle.Event.assert_not_called()
+
+    @parametrize("custom_input", [False, True])
+    def test_foreach_fallback_preserves_versions(self, custom_input):
+        params = [self._make_param(), self._make_param()]
+        for index, param in enumerate(params):
+            param.param_dtype = None
+            param.offload_to_cpu = False
+            param.sharded_state = ShardedState.SHARDED
+            param._sharded_param_data = torch.tensor([1.0, 2.0]) + 2 * index
+            param.fsdp_placement = SimpleNamespace(dim=0)
+            param.padded_sharded_param_size = torch.Size([2])
+            param.is_dtensor = False
+        layout = _ZeroCopyThenFallbackLayout()
+
+        def collective(output_tensor, input_tensor, group, async_op=False):
+            rank_major = input_tensor.repeat(2).view(2, -1)
+            if layout.split_sizes:
+                output_tensor.copy_(
+                    torch.cat([t.flatten() for t in rank_major.split(2, dim=1)])
+                )
+            else:
+                output_tensor.copy_(rank_major.flatten())
+
+        comm = MagicMock(spec=AllGather, side_effect=collective)
+        comm.layout = layout
+        comm.allocate.return_value = torch.empty(8)
+        group = MagicMock()
+        group.size.return_value = 2
+        group.rank.return_value = 0
+        stream = torch.cpu.current_stream()
+        input_hook = MagicMock(wraps=_default_all_gather_input_fn)
+        kwargs = {"all_gather_input_fn": input_hook} if custom_input else {}
+        for step in range(2):
+            result = foreach_all_gather(
+                params,
+                group,
+                False,
+                stream,
+                stream,
+                torch.device("cpu"),
+                comm,
+                **kwargs,
+            )
+            self.assertIsNotNone(result)
+            if step == 0:
+                self.assertIs(result.layout, layout)
+                self.assertIsNotNone(result.output_metadata)
+            else:
+                self.assertIs(result.layout, DEFAULT_ALL_GATHER_LAYOUT)
+                self.assertIsNone(result.output_metadata)
+            foreach_all_gather_copy_out(result, params, group)
+            for param in params:
+                param.init_unsharded_param()
+            if step == 0:
+                forward_params = [p._unsharded_param for p in params]
+                loss = sum(p.square().sum() for p in forward_params)
+                expected_grads = [2 * p.detach().clone() for p in forward_params]
+        self.assertEqual(input_hook.call_count, 2 if custom_input else 0)
+        loss.backward()
+        for param, forward_param, grad in zip(params, forward_params, expected_grads):
+            self.assertIs(param._unsharded_param, forward_param)
+            self.assertEqual(forward_param.grad, grad)
+
+    def test_input_hook_retains_independent_storage(self):
+        input_refs = []
+
+        def prepare_inputs(fsdp_params, group, device, comm):
+            tensor = torch.arange(4.0)
+            input_refs.append(weakref.ref(tensor))
+            return AllGatherInput(tensor, torch.empty(8), [[torch.float32]], [[4]], [4])
+
+        class TestAllGather(AllGather):
+            def __call__(self, output_tensor, input_tensor, group, async_op=False):
+                output_tensor.copy_(input_tensor.repeat(group.size()))
+
+            def allocate(self, size, *, dtype, device):
+                return torch.empty(size, dtype=dtype, device=device)
+
+        group = MagicMock()
+        group.size.return_value = 2
+        stream = torch.cpu.current_stream()
+        result = foreach_all_gather(
+            [],
+            group,
+            False,
+            stream,
+            stream,
+            torch.device("cpu"),
+            TestAllGather(),
+            all_gather_input_fn=prepare_inputs,
+        )
+        self.assertIsNotNone(result)
+        self.assertIs(result.all_gather_input, input_refs[0]())
+        self.assertNotEqual(
+            result.all_gather_input.untyped_storage().data_ptr(),
+            result.all_gather_output.untyped_storage().data_ptr(),
+        )
+        self.assertEqual(result.all_gather_output, torch.arange(4.0).repeat(2))
+        del result
+        self.assertIsNone(input_refs[0]())
+
+    @parametrize("output_hook", ["default", "nonzero_dim"])
+    def test_output_hook_waits_and_copies_nonzero_shards(self, output_hook):
+        param = self._make_param()
+        param.fsdp_placement = SimpleNamespace(dim=1)
+        param.padded_sharded_param_size = torch.Size([2, 3])
+        param.sharded_state = ShardedState.SHARDED
+        ranks = [torch.arange(6.0).view(2, 3) + rank * 10 for rank in range(2)]
+        source = torch.cat(ranks).flatten()
+        work = MagicMock(spec=dist.Work)
+        event = object()
+        result = AllGatherResult(source, event, work, [[torch.float32]], [[6]], [6])
+        handle = MagicMock()
+        order = []
+        handle.current_stream().wait_event.side_effect = lambda e: order.append("event")
+        work.wait.side_effect = lambda: order.append("work")
+        fn = (
+            _default_all_gather_output_fn
+            if output_hook == "default"
+            else all_gather_output_fn_for_nonzero_dim_shards
+        )
+
+        def output_callback(params, result, world_size):
+            self.assertEqual(order, ["event", "work"])
+            fn(params, result, world_size)
+
+        group = MagicMock()
+        group.size.return_value = 2
+        with patch(
+            "torch.distributed.fsdp._fully_shard._fsdp_collectives._get_device_handle",
+            return_value=handle,
+        ):
+            foreach_all_gather_copy_out(
+                result, [param], group, all_gather_output_fn=output_callback
+            )
+        self.assertEqual(
+            param.all_gather_outputs[0].view(2, 6), torch.cat(ranks, dim=1)
+        )
+        self.assertFalse(param._keep_all_gather_output_storage)
+
+    @parametrize("custom_layout", [False, True])
+    def test_output_hook_rejects_incompatible_layout(self, custom_layout):
+        param = self._make_param()
+        param._keep_all_gather_output_storage = not custom_layout
+        layout = (
+            _ParamContiguousTestLayout() if custom_layout else DefaultAllGatherLayout()
+        )
+        result = AllGatherResult(
+            torch.empty(8), None, None, [[torch.float32]], [[4]], [4], layout
+        )
+        callback = MagicMock()
+        with self.assertRaisesRegex(ValueError, "rank-major layout.*FSDP-owned"):
+            foreach_all_gather_copy_out(
+                result, [param], MagicMock(), all_gather_output_fn=callback
+            )
+        callback.assert_not_called()
+
+    def test_output_hook_rejects_default_layout_subclass(self):
+        class DerivedDefaultLayout(DefaultAllGatherLayout):
+            pass
+
+        param = self._make_param()
+        result = AllGatherResult(
+            torch.empty(8),
+            None,
+            None,
+            [[torch.float32]],
+            [[4]],
+            [4],
+            DerivedDefaultLayout(),
+        )
+        callback = MagicMock()
+        with self.assertRaisesRegex(ValueError, "rank-major layout"):
+            foreach_all_gather_copy_out(
+                result, [param], MagicMock(), all_gather_output_fn=callback
+            )
+        callback.assert_not_called()
+
+    @parametrize("mixed_dtype", [False, True])
+    @parametrize("inference", [False, True])
+    def test_default_copy_out(self, mixed_dtype, inference):
+        with torch.inference_mode(inference):
+            dtype = torch.bfloat16 if mixed_dtype else torch.float32
+            ranks = [
+                [
+                    torch.arange(6.0).view(2, 3) + 10 * rank,
+                    torch.arange(4, dtype=dtype) + 20 * rank,
+                ]
+                for rank in range(2)
+            ]
+            source = torch.cat(
+                [
+                    t.flatten().view(torch.uint8) if mixed_dtype else t.flatten()
+                    for tensors in ranks
+                    for t in tensors
+                ]
+            )
+            metadata = [
+                AllGatherParamMetadata(
+                    [6], [torch.float32], 1, torch.Size([2, 3]), [], False
+                ),
+                AllGatherParamMetadata([4], [dtype], 0, torch.Size([4]), [], False),
+            ]
+            layout = DefaultAllGatherLayout()
+            result = layout.finalize_outputs(source, metadata, 2, None)
+            self.assertFalse(result.backend_owned)
+            self.assertEqual(
+                result.tensors[0][0].view(2, 6), torch.cat([r[0] for r in ranks], dim=1)
+            )
+            self.assertEqual(result.tensors[1][0], torch.cat([r[1] for r in ranks]))
+            for param, tensors in zip(metadata, result.tensors):
+                param.outputs = tensors
+            repeated = layout.finalize_outputs(source, metadata, 2, None)
+            for old, new in zip(result.tensors, repeated.tensors):
+                self.assertIs(old, new)
+
+    @staticmethod
+    def _make_param():
+        param = FSDPParam.__new__(FSDPParam)
+        param.all_gather_outputs = []
+        param._unsharded_param = None
+        param._keep_all_gather_output_storage = False
+        param.sharded_param = SimpleNamespace(
+            _local_tensor=torch.empty(2), requires_grad=True
+        )
+        param._orig_size = torch.Size([4])
+        param._contiguous_orig_stride = (1,)
+        param.is_spmd_types = False
+        param._unsharded_dtensor_spec = None
+        param._release_all_gather_outputs_after_post_all_gather = False
+        param._unsharded_inner_tensors = []
+        return param
+
+    @parametrize("transition", ["fallback", "new_buffer", "native_to_custom"])
+    def test_transition_preserves_saved_tensors_and_gradients(self, transition):
+        params = [self._make_param(), self._make_param()]
+        source = torch.arange(1.0, 9.0)
+        initial_outputs = list(source.split(4))
+        storage_ptr = source.untyped_storage().data_ptr()
+        storage_nbytes = source.untyped_storage().nbytes()
+        initial_custom = transition != "native_to_custom"
+        _init_layout_outputs(
+            params,
+            AllGatherOutputs(
+                [[t if initial_custom else t.clone()] for t in initial_outputs],
+                initial_custom,
+            ),
+        )
+        for param in params:
+            param.init_unsharded_param()
+        forward_params = [p._unsharded_param for p in params]
+        saved_views = [p.view(2, 2) for p in forward_params]
+        loss = sum(view.square().sum() for view in saved_views)
+        expected = [2 * p.detach().clone() for p in forward_params]
+        for param in params:
+            param.free_unsharded_param()
+        with torch.no_grad():
+            if transition == "fallback":
+                # Model a raw-pointer collective overwriting the aliased output
+                # with rank-major data before fallback copies into stable views.
+                rank_major = torch.tensor([1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0])
+                with torch.autograd._unsafe_preserve_version_counter(source):
+                    source.copy_(rank_major)
+                metadata = [
+                    AllGatherParamMetadata(
+                        [2],
+                        [torch.float32],
+                        0,
+                        torch.Size([2]),
+                        p.all_gather_outputs,
+                        True,
+                    )
+                    for p in params
+                ]
+                result = DefaultAllGatherLayout().finalize_outputs(
+                    source, metadata, 2, None
+                )
+            else:
+                result = AllGatherOutputs(
+                    [[t] for t in torch.arange(1.0, 9.0).split(4)], True
+                )
+            _init_layout_outputs(params, result)
+            for param in params:
+                param.init_unsharded_param()
+        loss.backward()
+        self.assertEqual(source.untyped_storage().data_ptr(), storage_ptr)
+        self.assertEqual(source.untyped_storage().nbytes(), storage_nbytes)
+        for param, forward_param, grad in zip(params, forward_params, expected):
+            self.assertIs(param._unsharded_param, forward_param)
+            self.assertEqual(forward_param.grad, grad)
+        if not initial_custom:
+            for param in params:
+                param.free_unsharded_param()
+                self.assertEqual(
+                    param.all_gather_outputs[0].untyped_storage().nbytes(), 0
+                )
 
 
 class TestParamContiguousEligibility(TestCase):
