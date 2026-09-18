@@ -2401,13 +2401,12 @@ class TestFullyShardReduceOpWorldSize1(FSDPTest):
 
 @instantiate_parametrized_tests
 class TestAllGatherLayouts(TestCase):
-    def test_default_layout_is_shareable(self):
+    def test_default_layout_contract(self):
         layout = DefaultAllGatherLayout()
         layout._bind_owner(object())
         layout._bind_owner(object())
         self.assertIs(DefaultAllGather().layout, DEFAULT_ALL_GATHER_LAYOUT)
 
-    def test_default_layout_skips_param_contiguous_eligibility(self):
         comm = MagicMock(spec=AllGather)
         comm.layout = DEFAULT_ALL_GATHER_LAYOUT
         comm.allocate.return_value = torch.empty(4)
@@ -2606,39 +2605,23 @@ class TestAllGatherLayouts(TestCase):
         )
         self.assertFalse(param._keep_all_gather_output_storage)
 
-    @parametrize("custom_layout", [False, True])
-    def test_output_hook_rejects_incompatible_layout(self, custom_layout):
+    @parametrize("layout_kind", ["default_instance", "default_subclass", "custom"])
+    def test_output_hook_rejects_incompatible_layout(self, layout_kind):
+        class DerivedDefaultLayout(DefaultAllGatherLayout):
+            pass
+
         param = self._make_param()
-        param._keep_all_gather_output_storage = not custom_layout
-        layout = (
-            _ParamContiguousTestLayout() if custom_layout else DefaultAllGatherLayout()
-        )
+        param._keep_all_gather_output_storage = layout_kind == "default_instance"
+        layout = {
+            "default_instance": DefaultAllGatherLayout,
+            "default_subclass": DerivedDefaultLayout,
+            "custom": _ParamContiguousTestLayout,
+        }[layout_kind]()
         result = AllGatherResult(
             torch.empty(8), None, None, [[torch.float32]], [[4]], [4], layout
         )
         callback = MagicMock()
         with self.assertRaisesRegex(ValueError, "rank-major layout.*FSDP-owned"):
-            foreach_all_gather_copy_out(
-                result, [param], MagicMock(), all_gather_output_fn=callback
-            )
-        callback.assert_not_called()
-
-    def test_output_hook_rejects_default_layout_subclass(self):
-        class DerivedDefaultLayout(DefaultAllGatherLayout):
-            pass
-
-        param = self._make_param()
-        result = AllGatherResult(
-            torch.empty(8),
-            None,
-            None,
-            [[torch.float32]],
-            [[4]],
-            [4],
-            DerivedDefaultLayout(),
-        )
-        callback = MagicMock()
-        with self.assertRaisesRegex(ValueError, "rank-major layout"):
             foreach_all_gather_copy_out(
                 result, [param], MagicMock(), all_gather_output_fn=callback
             )
