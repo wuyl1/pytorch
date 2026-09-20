@@ -65,6 +65,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.debug import CommDebugMode
 from torch.distributed.tensor.experimental import implicit_replication
 from torch.testing._internal.common_cuda import SM90OrLater, TEST_CUDA, TEST_MULTIGPU
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_distributed import (
     MultiProcContinuousTest,
     PLATFORM_SUPPORTS_SYMM_MEM,
@@ -203,13 +204,48 @@ class _ParamContiguousTestLayout(AllGatherLayout):
         )
 
 
+class _ParamContiguousTestWork(dist.Work):
+    def __init__(self, work, source, output, split_sizes, world_size):
+        super().__init__()
+        self.work = work
+        self.source = source
+        self.output = output
+        self.split_sizes = list(split_sizes)
+        self.world_size = world_size
+        self.event = None
+
+    def wait(self, timeout=None):
+        stream = torch.get_device_module(self.output.device).current_stream()
+        if self.event is not None:
+            stream.wait_event(self.event)
+            return True
+        if self.work is not None:
+            self.work.wait()
+        source = self.source.view(self.world_size, -1)
+        input_offset = output_offset = 0
+        for size in self.split_sizes:
+            count = size * self.world_size
+            self.output.narrow(0, output_offset, count).copy_(
+                source[:, input_offset : input_offset + size].reshape(-1)
+            )
+            input_offset += size
+            output_offset += count
+        self.event = stream.record_event()
+        return True
+
+
 class _ParamContiguousTestAllGather(_RankMajorTestAllGather):
     """Emulate parameter-contiguous output with a persistent buffer."""
+
+    reuses_output_storage = True
 
     def __init__(self) -> None:
         super().__init__()
         self.output: torch.Tensor | None = None
         self.layout = _ParamContiguousTestLayout()
+        self.last_use = None
+        self.async_calls = 0
+        self.fallback_calls = 0
 
     def allocate(
         self,
@@ -218,6 +254,8 @@ class _ParamContiguousTestAllGather(_RankMajorTestAllGather):
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
+        if self.last_use is not None:
+            torch.get_device_module(device).current_stream().wait_event(self.last_use)
         if (
             self.output is None
             or self.output.numel() != torch.Size(size).numel()
@@ -235,29 +273,35 @@ class _ParamContiguousTestAllGather(_RankMajorTestAllGather):
         group: dist.ProcessGroup,
         async_op: bool = False,
     ) -> dist.distributed_c10d.Work | None:
-        if async_op:
-            raise AssertionError("test all-gather only supports sync collectives")
+        self.async_calls += int(async_op)
         if not self.layout.split_sizes:
+            self.fallback_calls += 1
             return dist.all_gather_single(
-                output_tensor, input_tensor, group=group, async_op=False
+                output_tensor, input_tensor, group=group, async_op=async_op
             )
         rank_major_output = torch.empty_like(output_tensor)
-        dist.all_gather_single(
-            rank_major_output, input_tensor, group=group, async_op=False
+        work = dist.all_gather_single(
+            rank_major_output, input_tensor, group=group, async_op=async_op
         )
-        rank_major_output = rank_major_output.view(self.layout.world_size, -1)
-        input_offset = 0
-        output_offset = 0
-        for split_size in self.layout.split_sizes:
-            output_numel = split_size * self.layout.world_size
-            output_tensor.narrow(0, output_offset, output_numel).copy_(
-                rank_major_output[:, input_offset : input_offset + split_size].reshape(
-                    -1
-                )
-            )
-            input_offset += split_size
-            output_offset += output_numel
+        result = _ParamContiguousTestWork(
+            work,
+            rank_major_output,
+            output_tensor,
+            self.layout.split_sizes,
+            self.layout.world_size,
+        )
+        if async_op:
+            return result
+        result.wait()
         return None
+
+    def release_output(self):
+        if self.output is not None:
+            self.last_use = (
+                torch.get_device_module(self.output.device)
+                .current_stream()
+                .record_event()
+            )
 
 
 class _ZeroCopyThenFallbackLayout(_ParamContiguousTestLayout):
@@ -2401,6 +2445,160 @@ class TestFullyShardReduceOpWorldSize1(FSDPTest):
 
 @instantiate_parametrized_tests
 class TestAllGatherLayouts(TestCase):
+    @parametrize("failure", ["allocate", "copy_in", "collective"])
+    def test_failed_gather_releases_output(self, failure):
+        stream = torch.cpu.current_stream()
+        released = []
+
+        class FailingAllGather(_RankMajorTestAllGather):
+            active = False
+
+            def allocate(self, size, *, dtype, device):
+                if failure == "allocate":
+                    raise RuntimeError("injected failure")
+                self.active = True
+                return torch.empty(size, dtype=dtype, device=device)
+
+            def __call__(self, output_tensor, input_tensor, group, async_op=False):
+                raise RuntimeError("injected failure")
+
+            def release_output(self):
+                if self.active:
+                    released.append(True)
+                    self.active = False
+
+        comm = FailingAllGather()
+
+        def input_fn(params, group, device, backend):
+            output = backend.allocate((4,), dtype=torch.float32, device=device)
+            if failure == "copy_in":
+                output.fill_(1)
+                raise RuntimeError("injected failure")
+            return AllGatherInput(torch.ones(2), output, [[torch.float32]], [[2]], [2])
+
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                foreach_all_gather(
+                    [],
+                    MagicMock(),
+                    False,
+                    stream,
+                    stream,
+                    torch.device("cpu"),
+                    comm,
+                    all_gather_input_fn=input_fn,
+                )
+            self.assertFalse(comm.active)
+        self.assertEqual(len(released), 0 if failure == "allocate" else 2)
+
+    def test_reset_pending_post_forward_release_is_idempotent(self):
+        group = FSDPParamGroup.__new__(FSDPParamGroup)
+        group._sharded_state = ShardedState.SHARDED_POST_FORWARD
+        group.fsdp_params = []
+        group.device_handle = MagicMock()
+        group.comm_ctx = MagicMock()
+        group._post_reduce_event = group._all_reduce_state = None
+        group._reshard_after_forward_event = None
+        group._post_forward_indices = []
+        group._all_gather_result = AllGatherResult(
+            torch.empty(0), None, None, [], [], []
+        )
+
+        class LeaseAllGather(_RankMajorTestAllGather):
+            active = True
+            releases = 0
+
+            def release_output(self):
+                if self.active:
+                    self.active = False
+                    self.releases += 1
+
+        group._all_gather_comm = LeaseAllGather()
+        group._reset_iter_state()
+        group._reset_iter_state()
+        self.assertEqual(group._all_gather_comm.releases, 1)
+        self.assertEqual(group._sharded_state, ShardedState.SHARDED)
+
+    @parametrize("cleanup", ["_reset_iter_state", "finalize_backward"])
+    def test_unused_prefetch_releases_output_and_preserves_versions(self, cleanup):
+        output = torch.arange(1.0, 5.0, requires_grad=True)
+        loss = output.square().sum()
+        order = []
+
+        class DeferredWork(dist.Work):
+            def wait(self, timeout=None):
+                with torch.no_grad():
+                    output.copy_(torch.arange(1.0, 5.0))
+                order.append("wait")
+                return True
+
+        group = FSDPParamGroup.__new__(FSDPParamGroup)
+        group._sharded_state = ShardedState.SHARDED
+        group.fsdp_params = []
+        group.device_handle = MagicMock()
+        group.comm_ctx = MagicMock()
+        group.comm_ctx._last_post_reduce_events = {}
+        group._post_reduce_event = group._all_reduce_state = None
+        group._reshard_after_forward_event = None
+        group._post_forward_indices = []
+        group._all_gather_result = AllGatherResult(
+            output, None, DeferredWork(), [[torch.float32]], [[2]], [2]
+        )
+        group._all_gather_comm = MagicMock(spec=AllGather)
+        group._all_gather_comm.release_output.side_effect = lambda: order.append(
+            "release"
+        )
+        getattr(group, cleanup)()
+        getattr(group, cleanup)()
+        self.assertEqual(order, ["wait", "release"])
+        self.assertIsNone(group._all_gather_result)
+        loss.backward()
+        self.assertEqual(output.grad, torch.arange(2.0, 9.0, 2.0))
+
+    @parametrize("post_forward", [False, True])
+    def test_reshard_releases_output_after_parameter_transition(self, post_forward):
+        group = FSDPParamGroup.__new__(FSDPParamGroup)
+        group._sharded_state = ShardedState.UNSHARDED
+        group._all_gather_comm = MagicMock(spec=AllGather)
+        group.fsdp_params = [MagicMock(), MagicMock()]
+        order = []
+        method = "to_sharded_post_forward" if post_forward else "to_sharded"
+        for param in group.fsdp_params:
+            getattr(param, method).side_effect = lambda: order.append("param")
+        group._all_gather_comm.release_output.side_effect = lambda: order.append(
+            "release"
+        )
+        transition = (
+            group._to_sharded_post_forward if post_forward else group._to_sharded
+        )
+        transition()
+        transition()
+        self.assertEqual(order, ["param", "param", "release"])
+
+    def test_deferred_work_write_preserves_saved_parameter_versions(self):
+        param = self._make_param()
+        param.fsdp_placement = SimpleNamespace(dim=0)
+        param.padded_sharded_param_size = torch.Size([2])
+        param.sharded_state = ShardedState.SHARDED
+        output = torch.arange(1.0, 5.0)
+        _init_layout_outputs([param], AllGatherOutputs([[output]], True))
+        param.init_unsharded_param()
+        loss = param._unsharded_param.square().sum()
+
+        class DeferredWork(dist.Work):
+            def wait(self, timeout=None):
+                output.copy_(torch.arange(1.0, 5.0))
+                return True
+
+        result = AllGatherResult(
+            output, None, DeferredWork(), [[torch.float32]], [[2]], [2]
+        )
+        group = MagicMock()
+        group.size.return_value = 2
+        foreach_all_gather_copy_out(result, [param], group)
+        loss.backward()
+        self.assertEqual(param._unsharded_param.grad, torch.arange(2.0, 9.0, 2.0))
+
     def test_default_layout_contract(self):
         layout = DefaultAllGatherLayout()
         layout._bind_owner(object())
@@ -2428,24 +2626,27 @@ class TestAllGatherLayouts(TestCase):
             )
         self.assertIs(result.layout, DEFAULT_ALL_GATHER_LAYOUT)
 
-    @parametrize("backend_owned", [False, True])
-    @parametrize("reuses_output", [False, True])
-    def test_reshard_orders_persistent_output_reuse(self, backend_owned, reuses_output):
+    @parametrize("reshard_after_forward", [True, False, 2])
+    def test_reshard_keeps_native_event_policy(self, reshard_after_forward):
         group = FSDPParamGroup.__new__(FSDPParamGroup)
-        group._training_state = TrainingState.POST_BACKWARD
-        group._all_gather_comm = SimpleNamespace(reuses_output_storage=reuses_output)
-        group.fsdp_params = [
-            SimpleNamespace(_keep_all_gather_output_storage=backend_owned)
-        ]
+        group._training_state = TrainingState.FORWARD
+        group.mesh_info = object()
+        group.post_forward_mesh_info = (
+            group.mesh_info if reshard_after_forward else None
+        )
+        if type(reshard_after_forward) is int:
+            group.post_forward_mesh_info = object()
         group.device_handle = MagicMock()
         group._to_sharded = MagicMock()
-        group._reshard_event = None
+        group._to_sharded_post_forward = MagicMock()
+        group._reshard_after_forward_event = None
         group.reshard()
-        group._to_sharded.assert_called_once()
-        if backend_owned or reuses_output:
+        if type(reshard_after_forward) is int:
+            group._to_sharded_post_forward.assert_called_once()
+            group._to_sharded.assert_not_called()
             group.device_handle.Event.assert_called_once()
-            group._reshard_event.record.assert_called_once()
-            event = group._reshard_event
+            group._reshard_after_forward_event.record.assert_called_once()
+            event = group._reshard_after_forward_event
             group._all_gather_result = None
             group._sharded_state = ShardedState.SHARDED
             group.unshard_in_backward = True
@@ -2459,12 +2660,14 @@ class TestAllGatherLayouts(TestCase):
                 event
             )
             group.comm_ctx.all_gather_stream.wait_event.assert_called_once_with(event)
-            group.device_handle.current_stream().wait_event.assert_called_once_with(
-                event
-            )
-            self.assertIsNone(group._reshard_event)
+            self.assertIsNone(group._reshard_after_forward_event)
         else:
             group.device_handle.Event.assert_not_called()
+            group._to_sharded_post_forward.assert_not_called()
+            if reshard_after_forward:
+                group._to_sharded.assert_called_once()
+            else:
+                group._to_sharded.assert_not_called()
 
     @parametrize("custom_input", [False, True])
     def test_foreach_fallback_preserves_versions(self, custom_input):
@@ -2809,6 +3012,97 @@ class TestParamContiguousEligibility(TestCase):
         # torch.compile / compiled autograd cannot trace the in-place aliasing.
         with patch("torch.compiler.is_compiling", return_value=True):
             self.assertFalse(self._can_use(self._make_param()))
+
+
+class TestFullyShardLayoutParity(FSDPTest):
+    @property
+    def world_size(self):
+        return 4
+
+    @skip_if_lt_x_gpu(4)
+    def test_layout_training(self, device):
+        self.run_subtests(
+            {
+                "reshard": [True, False, 2],
+                "async_op": [False, True],
+                "mixed": [False, True],
+            },
+            functools.partial(self._test_training, device=device),
+        )
+
+    @skip_if_lt_x_gpu(4)
+    def test_compiled_layout_training(self, device):
+        self.run_subtests(
+            {"custom": [False, True]},
+            functools.partial(
+                self._test_training,
+                device=device,
+                reshard=True,
+                async_op=False,
+                mixed=True,
+                compiled=True,
+            ),
+        )
+
+    def _test_training(
+        self,
+        device,
+        reshard,
+        async_op,
+        mixed,
+        compiled=False,
+        custom=True,
+    ):
+        torch.manual_seed(312)
+        native = nn.Sequential(*[MLP(16) for _ in range(3)]).to(device)
+        candidate = copy.deepcopy(native)
+        policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16 if mixed else None)
+        comms = []
+        for model in (native, candidate):
+            for block in model:
+                fully_shard(block, mp_policy=policy, reshard_after_forward=reshard)
+                if model is candidate and custom:
+                    comm = _ParamContiguousTestAllGather()
+                    block.set_custom_all_gather(comm)
+                    comms.append(comm)
+            fully_shard(model, mp_policy=policy, reshard_after_forward=False)
+            model._set_unshard_async_op(async_op)
+        run_candidate = (
+            torch.compile(candidate, backend="aot_eager") if compiled else candidate
+        )
+        optimizers = [
+            torch.optim.SGD(model.parameters(), lr=0.01)
+            for model in (native, candidate)
+        ]
+        for step in range(3):
+            torch.manual_seed(1234 + self.rank + step)
+            inp = torch.randn(4, 16, device=device)
+            losses = []
+            for model, optimizer in zip((native, run_candidate), optimizers):
+                optimizer.zero_grad(set_to_none=True)
+                loss = model(inp).float().square().sum()
+                loss.backward()
+                losses.append(loss.detach())
+            self.assertEqual(losses[0], losses[1])
+            for p, q in zip(native.parameters(), candidate.parameters()):
+                self.assertIsNotNone(p.grad)
+                self.assertIsNotNone(q.grad)
+                self.assertEqual(p.grad.to_local(), q.grad.to_local())
+            for optimizer in optimizers:
+                optimizer.step()
+            for p, q in zip(native.parameters(), candidate.parameters()):
+                self.assertEqual(p.to_local(), q.to_local())
+        if custom:
+            self.assertTrue(
+                all(comm.async_calls > 0 for comm in comms) if async_op else True
+            )
+            if type(reshard) is int:
+                self.assertTrue(all(comm.fallback_calls > 0 for comm in comms))
+
+
+instantiate_device_type_tests(
+    TestFullyShardLayoutParity, globals(), only_for=("cuda", "xpu")
+)
 
 
 if __name__ == "__main__":

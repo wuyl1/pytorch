@@ -40,8 +40,10 @@ class AllGatherParamMetadata:
 class AllGatherOutputs:
     """Outputs and whether FSDP must leave their storage to the backend.
 
-    Backend-owned storage must remain valid, including across reshard, until
-    the parameter group is destroyed. This contract does not recycle buffers.
+    Backend-owned storage must remain allocated, including across reshard,
+    until the parameter group is destroyed. After ``AllGather.release_output``
+    it may be shared with other groups, provided overwrites are ordered after
+    consumers and the same parameter regions are restored before the next use.
     """
 
     tensors: list[list[torch.Tensor]]

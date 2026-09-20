@@ -392,9 +392,9 @@ def _default_all_gather_input_fn(
     )
     # A persistent output can share version counters with saved parameters.
     preserve_version = (
-        any(param._keep_all_gather_output_storage for param in fsdp_params)
-        and not all_gather_output.is_inference()
-    )
+        all_gather_comm.reuses_output_storage
+        or any(param._keep_all_gather_output_storage for param in fsdp_params)
+    ) and not all_gather_output.is_inference()
     with (
         torch.autograd._unsafe_preserve_version_counter(all_gather_output)
         if preserve_version
@@ -431,42 +431,49 @@ def foreach_all_gather(
     all_gather_input_fn: Callable = _default_all_gather_input_fn,
 ) -> AllGatherResult | None:
     device_handle = _get_device_handle(device.type)
-    with device_handle.stream(all_gather_copy_in_stream):
-        all_gather_input = all_gather_input_fn(
-            fsdp_params, group, device, all_gather_comm
-        )
-    all_gather_output = all_gather_input.output_tensor
-    preserve_version = (
-        any(param._keep_all_gather_output_storage for param in fsdp_params)
-        and not all_gather_output.is_inference()
-    )
-    all_gather_stream.wait_stream(all_gather_copy_in_stream)
-    with (
-        device_handle.stream(all_gather_stream),
-        (
-            torch.autograd._unsafe_preserve_version_counter(all_gather_output)
-            if preserve_version
-            else nullcontext()
-        ),
-    ):
-        all_gather_work = all_gather_comm(
-            output_tensor=all_gather_input.output_tensor,
-            input_tensor=all_gather_input.input_tensor,
-            group=group,
-            async_op=async_op,
-        )
-        all_gather_event = all_gather_stream.record_event()
-        return AllGatherResult(
-            all_gather_input.output_tensor,
-            all_gather_event,
-            all_gather_work,
-            all_gather_input.param_all_gather_input_dtypes,
-            all_gather_input.param_all_gather_input_numels,
-            all_gather_input.all_gather_input_split_sizes,
-            all_gather_input.layout,
-            all_gather_input.output_metadata,
-            all_gather_input.input_tensor,
-        )
+    try:
+        with device_handle.stream(all_gather_copy_in_stream):
+            all_gather_input = all_gather_input_fn(
+                fsdp_params, group, device, all_gather_comm
+            )
+        all_gather_output = all_gather_input.output_tensor
+        preserve_version = (
+            all_gather_comm.reuses_output_storage
+            or any(param._keep_all_gather_output_storage for param in fsdp_params)
+        ) and not all_gather_output.is_inference()
+        all_gather_stream.wait_stream(all_gather_copy_in_stream)
+        with (
+            device_handle.stream(all_gather_stream),
+            (
+                torch.autograd._unsafe_preserve_version_counter(all_gather_output)
+                if preserve_version
+                else nullcontext()
+            ),
+        ):
+            all_gather_work = all_gather_comm(
+                output_tensor=all_gather_input.output_tensor,
+                input_tensor=all_gather_input.input_tensor,
+                group=group,
+                async_op=async_op,
+            )
+            all_gather_event = all_gather_stream.record_event()
+            return AllGatherResult(
+                all_gather_input.output_tensor,
+                all_gather_event,
+                all_gather_work,
+                all_gather_input.param_all_gather_input_dtypes,
+                all_gather_input.param_all_gather_input_numels,
+                all_gather_input.all_gather_input_split_sizes,
+                all_gather_input.layout,
+                all_gather_input.output_metadata,
+                all_gather_input.input_tensor,
+            )
+    except BaseException:
+        # No result reaches the parameter group to drive normal cleanup.
+        with device_handle.stream(all_gather_stream):
+            all_gather_stream.wait_stream(all_gather_copy_in_stream)
+            all_gather_comm.release_output()
+        raise
 
 
 @torch.no_grad()
@@ -550,6 +557,21 @@ def _default_all_gather_output_fn(
     _init_layout_outputs(fsdp_params, outputs)
 
 
+def _wait_all_gather(all_gather_result: AllGatherResult) -> None:
+    all_gather_event = all_gather_result.all_gather_event
+    all_gather_work = all_gather_result.all_gather_work
+    device = all_gather_result.all_gather_output.device
+    device_handle = _get_device_handle(device.type)
+    if all_gather_event is not None:  # sync op
+        device_handle.current_stream().wait_event(all_gather_event)
+    if isinstance(all_gather_work, dist.distributed_c10d.Work):  # async op
+        output = all_gather_result.all_gather_output
+        with torch.autograd._unsafe_preserve_version_counter(
+            () if output.is_inference() else (output,)
+        ):
+            all_gather_work.wait()
+
+
 @torch.no_grad()
 def foreach_all_gather_copy_out(
     all_gather_result: AllGatherResult,
@@ -558,14 +580,7 @@ def foreach_all_gather_copy_out(
     *,
     all_gather_output_fn: Callable = _default_all_gather_output_fn,
 ) -> None:
-    all_gather_event = all_gather_result.all_gather_event
-    all_gather_work = all_gather_result.all_gather_work
-    device = all_gather_result.all_gather_output.device
-    device_handle = _get_device_handle(device.type)
-    if all_gather_event is not None:  # sync op
-        device_handle.current_stream().wait_event(all_gather_event)
-    if isinstance(all_gather_work, dist.distributed_c10d.Work):  # async op
-        all_gather_work.wait()
+    _wait_all_gather(all_gather_result)
     if all_gather_output_fn is not _default_all_gather_output_fn and (
         all_gather_result.layout is not DEFAULT_ALL_GATHER_LAYOUT
         or any(param._keep_all_gather_output_storage for param in fsdp_params)

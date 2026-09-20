@@ -187,17 +187,28 @@ It returns `AllGatherOutputs`, which specifies the output tensors and their
 storage ownership. It runs on the compute stream after collective completion.
 The backend must track input, output, and metadata use on communication streams.
 Backends whose allocator reuses output storage must set
-`AllGather.reuses_output_storage=True`. FSDP then orders the next all-gather
-after the previous consumers, including for rank-major copy-out.
+`AllGather.reuses_output_storage=True`. FSDP then preserves version counters
+during writes to outputs that may alias saved parameters. The backend
+must implement `AllGather.release_output()` to record consumer completion on
+the current compute stream and order subsequent storage reuse, including input
+packing and collective writes. FSDP calls this notification after reshard or
+after waiting for a discarded unused prefetch. Its default implementation is
+a no-op; FSDP does not manage backend output pools or their reuse events.
+The notification must be idempotent when no output is active. Failed input
+preparation or collective setup also triggers it, ordered after work already
+queued by the call. A backend must reject reuse if partially failed communication
+cannot be safely recovered. Distributed-step recovery is not guaranteed.
 
 A stateful layout must use a separate instance per parameter group. For
 `backend_owned=True`, the backend must keep the output storage valid for the
 parameter group's lifetime. FSDP does not resize or recycle that storage on
-reshard. Thus, a persistent-buffer backend keeps a full all-gather output per
-group resident even after backward. This trades memory for buffer reuse and
-does not provide the memory saving of the default FSDP output path. It also
-does not imply `reshard_after_forward=False`: logical reshard and the next
-all-gather still follow the configured FSDP policy.
+reshard. A backend may share that storage between groups after release, provided
+it orders overwrites after all local and remote consumers and restores the same
+parameter regions before their next use. Without sharing, a persistent-buffer
+backend keeps a full output per group resident even after backward. Neither
+policy implies `reshard_after_forward=False`: logical reshard and the next
+all-gather still follow the configured FSDP policy. Pool sizing, registration,
+and synchronization belong to the backend.
 
 Once initialized, parameters and saved autograd views retain their storage.
 If a later call changes layout or returns different storage, FSDP copies into
