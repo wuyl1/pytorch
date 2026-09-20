@@ -175,44 +175,17 @@ for module in [*model.layers, model]:
     module.set_custom_all_gather(MyAllGather())
 ```
 
-Every all-gather backend has an `AllGather.layout`. The default
-`DefaultAllGatherLayout` implements rank-major copy-in and copy-out. Custom
-layouts override input packing and output handling. Returning `None` from
-`prepare_output` selects the default layout for that call, including its
-output finalizer.
+Create a separate stateful backend instance for each FSDP parameter group, as
+shown above. Sharing storage through a backend pool does not permit sharing a
+stateful instance. The stateless default layout has no ownership restriction.
+Install the backend before the first unshard. Replacement is rejected while an
+all-gather is pending, while parameters are unsharded, or after they adopt backend-owned output storage;
+those parameters must keep their original storage owner and reuse coordination.
 
-`finalize_outputs` receives tensors and per-parameter dtype, size, and shard
-metadata through `AllGatherParamMetadata`; it does not receive FSDP internals.
-It returns `AllGatherOutputs`, which specifies the output tensors and their
-storage ownership. It runs on the compute stream after collective completion.
-The backend must track input, output, and metadata use on communication streams.
-Backends whose allocator reuses output storage must set
-`AllGather.reuses_output_storage=True`. FSDP then preserves version counters
-during writes to outputs that may alias saved parameters. The backend
-must implement `AllGather.release_output()` to record consumer completion on
-the current compute stream and order subsequent storage reuse, including input
-packing and collective writes. FSDP calls this notification after reshard or
-after waiting for a discarded unused prefetch. Its default implementation is
-a no-op; FSDP does not manage backend output pools or their reuse events.
-The notification must be idempotent when no output is active. Failed input
-preparation or collective setup also triggers it, ordered after work already
-queued by the call. A backend must reject reuse if partially failed communication
-cannot be safely recovered. Distributed-step recovery is not guaranteed.
-
-A stateful layout must use a separate instance per parameter group. For
-`backend_owned=True`, the backend must keep the output storage valid for the
-parameter group's lifetime. FSDP does not resize or recycle that storage on
-reshard. A backend may share that storage between groups after release, provided
-it orders overwrites after all local and remote consumers and restores the same
-parameter regions before their next use. Without sharing, a persistent-buffer
-backend keeps a full output per group resident even after backward. Neither
-policy implies `reshard_after_forward=False`: logical reshard and the next
-all-gather still follow the configured FSDP policy. Pool sizing, registration,
-and synchronization belong to the backend.
-
-Once initialized, parameters and saved autograd views retain their storage.
-If a later call changes layout or returns different storage, FSDP copies into
-the existing destinations. Zero-copy therefore requires stable output views.
+Custom backends may retain registered output storage after reshard. Consult the
+backend's documentation for its memory usage, supported execution modes, and
+compatibility requirements. Backend authoring interfaces remain private and
+experimental; they are not part of the public FSDP API.
 
 ```{eval-rst}
 .. currentmodule:: torch.distributed.fsdp

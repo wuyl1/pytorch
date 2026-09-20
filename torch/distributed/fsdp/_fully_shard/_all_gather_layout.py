@@ -1,9 +1,26 @@
+"""Experimental, private contract for FSDP all-gather backend authors.
+
+Preparation selects a layout before output allocation. Returning None selects
+the native rank-major input packing and output finalizer. Custom layouts pack
+into independent input storage by default; the internal copy-in callable keeps
+the native operator's signature, including its rank argument.
+
+Finalization receives tensor-only parameter metadata on the compute stream,
+after collective completion. Existing parameter objects and saved aliases keep
+their storage when layouts change. Backend-owned storage stays allocated across
+reshard, but its lease may be shared after AllGather.release_output(). The
+backend, not FSDP, must order reuse after all local and remote consumers and
+restore each parameter's original storage region before its next use.
+
+These authoring types are not exported from torch.distributed.fsdp. Out-of-tree
+backends must target a matching revision of this private interface.
+"""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -17,6 +34,18 @@ AllGatherCopyIn = Callable[
     [list[torch.Tensor], torch.Tensor, list[int], int, int],
     tuple[torch.Tensor, torch.Tensor],
 ]
+
+
+@dataclass(frozen=True, kw_only=True)
+class AllGatherInputMetadata:
+    """Description of this call's flattened local input and output eligibility."""
+
+    input_split_sizes: list[int]
+    input_numel: int
+    world_size: int
+    dtype: torch.dtype
+    device: torch.device
+    can_use_param_contiguous_output: bool
 
 
 @dataclass
@@ -55,6 +84,9 @@ class AllGatherLayout(ABC):
 
     FSDP orders collective completion before finalization. The backend owns
     communication stream lifetimes and any persistent registered storage.
+    Create a separate stateful backend/layout instance per parameter group;
+    share storage through the backend's pool, not by sharing the layout instance.
+    The stateless default layout is exempt from this ownership restriction.
     """
 
     _owner: object | None = None
@@ -65,46 +97,24 @@ class AllGatherLayout(ABC):
         elif self._owner is not owner:
             raise ValueError(
                 "an all-gather layout instance cannot be shared across FSDP "
-                "parameter groups"
+                "parameter groups; create a separate stateful backend/layout "
+                "instance for each group (shared storage may use a backend pool)"
             )
 
     def prepare(
         self,
-        input_split_sizes: list[int],
-        input_numel: int,
-        world_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        param_input_dtypes: list[list[torch.dtype]],
-        param_input_numels: list[list[int]],
-        can_use_param_contiguous_output: bool,
+        input_metadata: AllGatherInputMetadata,
     ) -> tuple[AllGatherCopyIn, AllGatherLayout, object | None]:
         """Select input packing and metadata before allocating the output."""
-        metadata = self.prepare_output(
-            input_split_sizes,
-            input_numel,
-            world_size,
-            dtype,
-            device,
-            param_input_dtypes,
-            param_input_numels,
-            can_use_param_contiguous_output,
-        )
+        metadata = self.prepare_output(input_metadata)
         if metadata is None:
             return torch.ops.fsdp.all_gather_copy_in, DEFAULT_ALL_GATHER_LAYOUT, None
-        return partial(self.copy_in, output_metadata=metadata), self, metadata
+        return self.copy_in, self, metadata
 
     @abstractmethod
     def prepare_output(
         self,
-        input_split_sizes: list[int],
-        input_numel: int,
-        world_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        param_input_dtypes: list[list[torch.dtype]],
-        param_input_numels: list[list[int]],
-        can_use_param_contiguous_output: bool,
+        input_metadata: AllGatherInputMetadata,
     ) -> object | None:
         """Return per-call metadata, or None to use rank-major input and output.
 
@@ -120,16 +130,22 @@ class AllGatherLayout(ABC):
         all_gather_input_split_sizes: list[int],
         all_gather_input_numel: int,
         rank: int,
-        output_metadata: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pack inputs for a collective using this layout."""
-        return torch.ops.fsdp.all_gather_copy_in(
-            all_gather_inputs,
-            all_gather_output,
-            all_gather_input_split_sizes,
-            all_gather_input_numel,
-            rank,
+        """Pack into independent input storage without modifying the output.
+
+        The signature matches the native rank-major copy-in operator. Layouts
+        that opt into rank-local packing may use rank; this default does not.
+        """
+        all_gather_input = torch.empty(
+            (all_gather_input_numel,),
+            dtype=all_gather_output.dtype,
+            device=all_gather_output.device,
         )
+        torch._foreach_copy_(
+            torch.split(all_gather_input, all_gather_input_split_sizes),
+            all_gather_inputs,
+        )
+        return all_gather_input, all_gather_output
 
     @abstractmethod
     def finalize_outputs(
@@ -176,12 +192,28 @@ class DefaultAllGatherLayout(AllGatherLayout):
         pass
 
     def prepare(
-        self, *args: object, **kwargs: object
+        self, input_metadata: AllGatherInputMetadata
     ) -> tuple[AllGatherCopyIn, AllGatherLayout, object | None]:
         return torch.ops.fsdp.all_gather_copy_in, self, None
 
-    def prepare_output(self, *args: object, **kwargs: object) -> None:
+    def prepare_output(self, input_metadata: AllGatherInputMetadata) -> None:
         return None
+
+    def copy_in(
+        self,
+        all_gather_inputs: list[torch.Tensor],
+        all_gather_output: torch.Tensor,
+        all_gather_input_split_sizes: list[int],
+        all_gather_input_numel: int,
+        rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.fsdp.all_gather_copy_in(
+            all_gather_inputs,
+            all_gather_output,
+            all_gather_input_split_sizes,
+            all_gather_input_numel,
+            rank,
+        )
 
     def finalize_outputs(
         self,
@@ -258,9 +290,14 @@ def _can_use_param_contiguous_output(
     param_input_numels: list[list[int]],
     output_dtype: torch.dtype,
 ) -> bool:
+    from torch._dynamo.compiled_autograd import (
+        compiled_autograd_enabled,
+        in_compiled_autograd_region,
+    )
+
     from ._fsdp_param import ShardedState
 
-    if _compile_active():
+    if compiled_autograd_enabled or in_compiled_autograd_region:
         return False
     if not (len(fsdp_params) == len(param_input_dtypes) == len(param_input_numels)):
         return False
@@ -279,14 +316,6 @@ def _can_use_param_contiguous_output(
         ):
             return False
     return True
-
-
-def _compile_active() -> bool:
-    if torch.compiler.is_compiling():
-        return True
-    from torch._dynamo.compiled_autograd import compiled_autograd_enabled
-
-    return compiled_autograd_enabled
 
 
 def _init_layout_outputs(

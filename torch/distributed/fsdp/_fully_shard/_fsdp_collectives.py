@@ -15,8 +15,10 @@ from torch.distributed.tensor import DTensor
 from ._all_gather_layout import (
     _can_use_param_contiguous_output,
     _init_layout_outputs,
+    AllGatherInputMetadata,
     AllGatherParamMetadata,
     DEFAULT_ALL_GATHER_LAYOUT,
+    DefaultAllGatherLayout,
 )
 from ._fsdp_api import _ReduceOp
 from ._fsdp_common import (
@@ -368,24 +370,20 @@ def _default_all_gather_input_fn(
     inp_split_sizes = [t.numel() for t in all_gather_inputs]
     all_gather_input_numel = sum(inp_split_sizes)
     layout = all_gather_comm.layout
-    can_use_param_contiguous_output = (
-        layout is not DEFAULT_ALL_GATHER_LAYOUT
-        and _can_use_param_contiguous_output(
-            fsdp_params,
-            param_all_gather_input_dtypes,
-            param_all_gather_input_numels,
-            dtype,
-        )
-    )
     copy_in, layout, output_metadata = layout.prepare(
-        inp_split_sizes,
-        all_gather_input_numel,
-        world_size,
-        dtype,
-        device,
-        param_all_gather_input_dtypes,
-        param_all_gather_input_numels,
-        can_use_param_contiguous_output,
+        AllGatherInputMetadata(
+            input_split_sizes=inp_split_sizes,
+            input_numel=all_gather_input_numel,
+            world_size=world_size,
+            dtype=dtype,
+            device=device,
+            can_use_param_contiguous_output=_can_use_param_contiguous_output(
+                fsdp_params,
+                param_all_gather_input_dtypes,
+                param_all_gather_input_numels,
+                dtype,
+            ),
+        )
     )
     all_gather_output = all_gather_comm.allocate(
         (all_gather_input_numel * world_size,), dtype=dtype, device=device
@@ -582,7 +580,7 @@ def foreach_all_gather_copy_out(
 ) -> None:
     _wait_all_gather(all_gather_result)
     if all_gather_output_fn is not _default_all_gather_output_fn and (
-        all_gather_result.layout is not DEFAULT_ALL_GATHER_LAYOUT
+        type(all_gather_result.layout) is not DefaultAllGatherLayout
         or any(param._keep_all_gather_output_storage for param in fsdp_params)
     ):
         raise ValueError(

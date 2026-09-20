@@ -31,6 +31,7 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp._fully_shard._all_gather_layout import (
     _can_use_param_contiguous_output,
     _init_layout_outputs,
+    AllGatherInputMetadata,
     AllGatherLayout,
     AllGatherOutputs,
     AllGatherParamMetadata,
@@ -151,41 +152,14 @@ class _ParamContiguousTestLayout(AllGatherLayout):
 
     def prepare_output(
         self,
-        input_split_sizes: list[int],
-        input_numel: int,
-        world_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        param_input_dtypes: list[list[torch.dtype]],
-        param_input_numels: list[list[int]],
-        can_use_param_contiguous_output: bool,
+        input_metadata: AllGatherInputMetadata,
     ) -> object | None:
         self.split_sizes = []
-        if not can_use_param_contiguous_output:
+        if not input_metadata.can_use_param_contiguous_output:
             return None
-        self.split_sizes = input_split_sizes
-        self.world_size = world_size
+        self.split_sizes = input_metadata.input_split_sizes
+        self.world_size = input_metadata.world_size
         return self.split_sizes
-
-    def copy_in(
-        self,
-        all_gather_inputs: list[torch.Tensor],
-        all_gather_output: torch.Tensor,
-        all_gather_input_split_sizes: list[int],
-        all_gather_input_numel: int,
-        rank: int,
-        output_metadata: object,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        all_gather_input = torch.empty(
-            (all_gather_input_numel,),
-            dtype=all_gather_output.dtype,
-            device=all_gather_output.device,
-        )
-        torch._foreach_copy_(
-            torch.split(all_gather_input, all_gather_input_split_sizes),
-            all_gather_inputs,
-        )
-        return all_gather_input, all_gather_output
 
     def finalize_outputs(
         self,
@@ -246,6 +220,7 @@ class _ParamContiguousTestAllGather(_RankMajorTestAllGather):
         self.last_use = None
         self.async_calls = 0
         self.fallback_calls = 0
+        self.param_contiguous_calls = 0
 
     def allocate(
         self,
@@ -279,6 +254,7 @@ class _ParamContiguousTestAllGather(_RankMajorTestAllGather):
             return dist.all_gather_single(
                 output_tensor, input_tensor, group=group, async_op=async_op
             )
+        self.param_contiguous_calls += 1
         rank_major_output = torch.empty_like(output_tensor)
         work = dist.all_gather_single(
             rank_major_output, input_tensor, group=group, async_op=async_op
@@ -309,10 +285,10 @@ class _ZeroCopyThenFallbackLayout(_ParamContiguousTestLayout):
         super().__init__()
         self._first = True
 
-    def prepare_output(self, *args: object, **kwargs: object) -> object | None:
+    def prepare_output(self, input_metadata: AllGatherInputMetadata) -> object | None:
         if self._first:
             self._first = False
-            return super().prepare_output(*args, **kwargs)  # type: ignore[arg-type]
+            return super().prepare_output(input_metadata)
         self.split_sizes = []
         return None
 
@@ -2445,6 +2421,81 @@ class TestFullyShardReduceOpWorldSize1(FSDPTest):
 
 @instantiate_parametrized_tests
 class TestAllGatherLayouts(TestCase):
+    @parametrize("custom", [False, True])
+    @parametrize("rank", [0, 1])
+    def test_layout_copy_in_storage(self, custom, rank):
+        layout = _ParamContiguousTestLayout() if custom else DefaultAllGatherLayout()
+        metadata = AllGatherInputMetadata(
+            input_split_sizes=[2, 4],
+            input_numel=6,
+            world_size=2,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            can_use_param_contiguous_output=True,
+        )
+        copy_in, selected, output_metadata = layout.prepare(metadata)
+        self.assertIs(selected, layout)
+        if custom:
+            self.assertIs(type(layout).copy_in, AllGatherLayout.copy_in)
+            self.assertEqual(output_metadata, [2, 4])
+            self.assertEqual(layout.world_size, 2)
+        else:
+            self.assertIs(copy_in, torch.ops.fsdp.all_gather_copy_in)
+            self.assertIsNone(output_metadata)
+        inputs = [torch.arange(2.0), torch.arange(4.0)]
+        for pack in (copy_in, layout.copy_in):
+            output = torch.full((12,), -1.0)
+            source, returned = pack(inputs, output, [2, 4], 6, rank)
+            self.assertIs(returned, output)
+            self.assertEqual(source, torch.cat(inputs))
+            if custom:
+                self.assertNotEqual(
+                    source.untyped_storage().data_ptr(),
+                    output.untyped_storage().data_ptr(),
+                )
+                self.assertEqual(output, torch.full_like(output, -1.0))
+            else:
+                self.assertEqual(source.data_ptr(), output[rank * 6 :].data_ptr())
+                expected = torch.full_like(output, -1.0)
+                expected[rank * 6 : (rank + 1) * 6] = torch.cat(inputs)
+                self.assertEqual(output, expected)
+
+    @parametrize("rank", [0, 1])
+    def test_native_input_preparation_uses_layout(self, rank):
+        group = MagicMock()
+        group.size.return_value, group.rank.return_value = 2, rank
+        with (
+            patch(
+                "torch.distributed.fsdp._fully_shard._fsdp_collectives."
+                "_get_param_all_gather_inputs",
+                return_value=[[torch.arange(2.0), torch.arange(4.0)]],
+            ),
+            patch.object(
+                DEFAULT_ALL_GATHER_LAYOUT,
+                "prepare",
+                wraps=DEFAULT_ALL_GATHER_LAYOUT.prepare,
+            ) as prepare,
+        ):
+            result = _default_all_gather_input_fn(
+                [], group, torch.device("cpu"), DefaultAllGather()
+            )
+        prepare.assert_called_once_with(
+            AllGatherInputMetadata(
+                input_split_sizes=[2, 4],
+                input_numel=6,
+                world_size=2,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                can_use_param_contiguous_output=False,
+            )
+        )
+        self.assertIs(result.layout, DEFAULT_ALL_GATHER_LAYOUT)
+        self.assertIsNone(result.output_metadata)
+        self.assertEqual(result.input_tensor, torch.tensor([0.0, 1, 0, 1, 2, 3]))
+        self.assertEqual(
+            result.input_tensor.data_ptr(), result.output_tensor[rank * 6 :].data_ptr()
+        )
+
     @parametrize("failure", ["allocate", "copy_in", "collective"])
     def test_failed_gather_releases_output(self, failure):
         stream = torch.cpu.current_stream()
@@ -2599,7 +2650,8 @@ class TestAllGatherLayouts(TestCase):
         loss.backward()
         self.assertEqual(param._unsharded_param.grad, torch.arange(2.0, 9.0, 2.0))
 
-    def test_default_layout_contract(self):
+    @parametrize("eligible", [False, True])
+    def test_default_layout_contract(self, eligible):
         layout = DefaultAllGatherLayout()
         layout._bind_owner(object())
         layout._bind_owner(object())
@@ -2618,7 +2670,7 @@ class TestAllGatherLayouts(TestCase):
             ),
             patch(
                 "torch.distributed.fsdp._fully_shard._fsdp_collectives._can_use_param_contiguous_output",
-                side_effect=AssertionError("default layout evaluated eligibility"),
+                return_value=eligible,
             ),
         ):
             result = _default_all_gather_input_fn(
@@ -2770,7 +2822,10 @@ class TestAllGatherLayouts(TestCase):
         self.assertIsNone(input_refs[0]())
 
     @parametrize("output_hook", ["default", "nonzero_dim"])
-    def test_output_hook_waits_and_copies_nonzero_shards(self, output_hook):
+    @parametrize("fresh_layout", [False, True])
+    def test_output_hook_waits_and_copies_nonzero_shards(
+        self, output_hook, fresh_layout
+    ):
         param = self._make_param()
         param.fsdp_placement = SimpleNamespace(dim=1)
         param.padded_sharded_param_size = torch.Size([2, 3])
@@ -2779,7 +2834,20 @@ class TestAllGatherLayouts(TestCase):
         source = torch.cat(ranks).flatten()
         work = MagicMock(spec=dist.Work)
         event = object()
-        result = AllGatherResult(source, event, work, [[torch.float32]], [[6]], [6])
+        layout = DefaultAllGatherLayout() if fresh_layout else DEFAULT_ALL_GATHER_LAYOUT
+        _, layout, output_metadata = layout.prepare(
+            AllGatherInputMetadata(
+                input_split_sizes=[6],
+                input_numel=6,
+                world_size=2,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                can_use_param_contiguous_output=False,
+            )
+        )
+        result = AllGatherResult(
+            source, event, work, [[torch.float32]], [[6]], [6], layout, output_metadata
+        )
         handle = MagicMock()
         order = []
         handle.current_stream().wait_event.side_effect = lambda e: order.append("event")
@@ -2950,16 +3018,53 @@ class TestAllGatherLayouts(TestCase):
                 )
 
 
+@instantiate_parametrized_tests
 class TestParamContiguousEligibility(TestCase):
-    """Runtime-free tests for the conservative param-contiguous eligibility gate."""
+    """CPU tests for layout ownership and param-contiguous eligibility."""
+
+    @parametrize("backend_owned", [False, True])
+    @parametrize("pending", [False, True])
+    @parametrize("unsharded", [False, True])
+    def test_backend_replacement_preserves_output_owner(
+        self, backend_owned, pending, unsharded
+    ):
+        previous = DefaultAllGather()
+        replacement = _ParamContiguousTestAllGather()
+        group = SimpleNamespace(
+            fsdp_params=[
+                SimpleNamespace(_keep_all_gather_output_storage=backend_owned)
+            ],
+            _all_gather_comm=previous,
+            _all_gather_result=object() if pending else None,
+            is_unsharded=unsharded,
+        )
+        state = SimpleNamespace(_fsdp_param_groups=[group])
+        module = SimpleNamespace(_get_fsdp_state=lambda: state)
+        FSDPModule.set_custom_all_gather(module, previous)
+        if backend_owned or pending or unsharded:
+            with self.assertRaisesRegex(ValueError, "cannot replace.*all-gather"):
+                FSDPModule.set_custom_all_gather(module, replacement)
+            self.assertIs(group._all_gather_comm, previous)
+            self.assertIsNone(replacement.layout._owner)
+        else:
+            FSDPModule.set_custom_all_gather(module, replacement)
+            self.assertIs(group._all_gather_comm, replacement)
 
     def test_layout_instance_is_bound_to_one_owner(self):
         layout = _ParamContiguousTestLayout()
         owner = object()
         layout._bind_owner(owner)
         layout._bind_owner(owner)
-        with self.assertRaisesRegex(ValueError, "cannot be shared"):
+        with self.assertRaisesRegex(
+            ValueError, "create a separate.*instance for each group"
+        ):
             layout._bind_owner(object())
+
+    def test_stateless_default_layout_can_be_shared(self):
+        layout = DefaultAllGatherLayout()
+        layout._bind_owner(object())
+        layout._bind_owner(object())
+        self.assertIsNone(layout._owner)
 
     @staticmethod
     def _make_param(
@@ -3009,9 +3114,45 @@ class TestParamContiguousEligibility(TestCase):
                 [self._make_param()], [[torch.bfloat16]], [[8]], torch.float32
             )
         )
-        # torch.compile / compiled autograd cannot trace the in-place aliasing.
-        with patch("torch.compiler.is_compiling", return_value=True):
+
+    def test_compiled_autograd_disables_param_contiguous_output(self):
+        from torch._dynamo import compiled_autograd
+
+        self.assertTrue(self._can_use(self._make_param()))
+        with compiled_autograd._enable(lambda graph: graph):
             self.assertFalse(self._can_use(self._make_param()))
+        self.assertTrue(self._can_use(self._make_param()))
+
+    def test_compiled_backward_disables_param_contiguous_output(self):
+        from torch._dynamo import compiled_autograd
+
+        torch._dynamo.reset()
+        observations = []
+
+        @torch._dynamo.disable
+        def hook(grad):
+            observations.append(
+                (
+                    compiled_autograd.compiled_autograd_enabled,
+                    compiled_autograd.in_compiled_autograd_region,
+                    self._can_use(self._make_param()),
+                )
+            )
+            return grad
+
+        try:
+            value = torch.tensor([2.0], requires_grad=True)
+            output = value.square()
+            output.register_hook(hook)
+            with compiled_autograd._enable(
+                lambda graph: torch.compile(graph, backend="aot_eager")
+            ):
+                output.sum().backward()
+            self.assertEqual(value.grad, torch.tensor([4.0]))
+            self.assertEqual(observations, [(False, True, False)])
+            self.assertTrue(self._can_use(self._make_param()))
+        finally:
+            torch._dynamo.reset()
 
 
 class TestFullyShardLayoutParity(FSDPTest):
@@ -3093,11 +3234,15 @@ class TestFullyShardLayoutParity(FSDPTest):
             for p, q in zip(native.parameters(), candidate.parameters()):
                 self.assertEqual(p.to_local(), q.to_local())
         if custom:
+            self.assertTrue(all(comm.param_contiguous_calls > 0 for comm in comms))
             self.assertTrue(
                 all(comm.async_calls > 0 for comm in comms) if async_op else True
             )
             if type(reshard) is int:
                 self.assertTrue(all(comm.fallback_calls > 0 for comm in comms))
+            if compiled:
+                # FSDP hooks run eagerly even when the model compute is compiled.
+                self.assertTrue(all(comm.fallback_calls == 0 for comm in comms))
 
 
 instantiate_device_type_tests(
