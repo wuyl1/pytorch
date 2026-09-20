@@ -2422,63 +2422,31 @@ class TestFullyShardReduceOpWorldSize1(FSDPTest):
 @instantiate_parametrized_tests
 class TestAllGatherLayouts(TestCase):
     @parametrize("custom", [False, True])
+    @parametrize("eligible", [False, True])
     @parametrize("rank", [0, 1])
-    def test_layout_copy_in_storage(self, custom, rank):
-        layout = _ParamContiguousTestLayout() if custom else DefaultAllGatherLayout()
-        metadata = AllGatherInputMetadata(
-            input_split_sizes=[2, 4],
-            input_numel=6,
-            world_size=2,
-            dtype=torch.float32,
-            device=torch.device("cpu"),
-            can_use_param_contiguous_output=True,
-        )
-        copy_in, selected, output_metadata = layout.prepare(metadata)
-        self.assertIs(selected, layout)
-        if custom:
-            self.assertIs(type(layout).copy_in, AllGatherLayout.copy_in)
-            self.assertEqual(output_metadata, [2, 4])
-            self.assertEqual(layout.world_size, 2)
-        else:
-            self.assertIs(copy_in, torch.ops.fsdp.all_gather_copy_in)
-            self.assertIsNone(output_metadata)
-        inputs = [torch.arange(2.0), torch.arange(4.0)]
-        for pack in (copy_in, layout.copy_in):
-            output = torch.full((12,), -1.0)
-            source, returned = pack(inputs, output, [2, 4], 6, rank)
-            self.assertIs(returned, output)
-            self.assertEqual(source, torch.cat(inputs))
-            if custom:
-                self.assertNotEqual(
-                    source.untyped_storage().data_ptr(),
-                    output.untyped_storage().data_ptr(),
-                )
-                self.assertEqual(output, torch.full_like(output, -1.0))
-            else:
-                self.assertEqual(source.data_ptr(), output[rank * 6 :].data_ptr())
-                expected = torch.full_like(output, -1.0)
-                expected[rank * 6 : (rank + 1) * 6] = torch.cat(inputs)
-                self.assertEqual(output, expected)
-
-    @parametrize("rank", [0, 1])
-    def test_native_input_preparation_uses_layout(self, rank):
+    def test_input_preparation_uses_layout_and_preserves_storage(
+        self, custom, eligible, rank
+    ):
+        comm = _ParamContiguousTestAllGather() if custom else DefaultAllGather()
         group = MagicMock()
         group.size.return_value, group.rank.return_value = 2, rank
+        inputs = [torch.arange(2.0), torch.arange(4.0)]
+        output = torch.full((12,), -1.0)
         with (
             patch(
                 "torch.distributed.fsdp._fully_shard._fsdp_collectives."
                 "_get_param_all_gather_inputs",
-                return_value=[[torch.arange(2.0), torch.arange(4.0)]],
+                return_value=[inputs],
             ),
-            patch.object(
-                DEFAULT_ALL_GATHER_LAYOUT,
-                "prepare",
-                wraps=DEFAULT_ALL_GATHER_LAYOUT.prepare,
-            ) as prepare,
+            patch(
+                "torch.distributed.fsdp._fully_shard._fsdp_collectives."
+                "_can_use_param_contiguous_output",
+                return_value=eligible,
+            ),
+            patch.object(comm, "allocate", return_value=output),
+            patch.object(comm.layout, "prepare", wraps=comm.layout.prepare) as prepare,
         ):
-            result = _default_all_gather_input_fn(
-                [], group, torch.device("cpu"), DefaultAllGather()
-            )
+            result = _default_all_gather_input_fn([], group, torch.device("cpu"), comm)
         prepare.assert_called_once_with(
             AllGatherInputMetadata(
                 input_split_sizes=[2, 4],
@@ -2486,15 +2454,27 @@ class TestAllGatherLayouts(TestCase):
                 world_size=2,
                 dtype=torch.float32,
                 device=torch.device("cpu"),
-                can_use_param_contiguous_output=False,
+                can_use_param_contiguous_output=eligible,
             )
         )
-        self.assertIs(result.layout, DEFAULT_ALL_GATHER_LAYOUT)
-        self.assertIsNone(result.output_metadata)
-        self.assertEqual(result.input_tensor, torch.tensor([0.0, 1, 0, 1, 2, 3]))
-        self.assertEqual(
-            result.input_tensor.data_ptr(), result.output_tensor[rank * 6 :].data_ptr()
-        )
+        source = result.input_tensor
+        self.assertIs(result.output_tensor, output)
+        self.assertEqual(source, torch.cat(inputs))
+        if custom and eligible:
+            self.assertIs(result.layout, comm.layout)
+            self.assertEqual(result.output_metadata, [2, 4])
+            self.assertEqual(comm.layout.world_size, 2)
+            self.assertNotEqual(
+                source.untyped_storage().data_ptr(), output.untyped_storage().data_ptr()
+            )
+            self.assertEqual(output, torch.full_like(output, -1.0))
+        else:
+            self.assertIs(result.layout, DEFAULT_ALL_GATHER_LAYOUT)
+            self.assertIsNone(result.output_metadata)
+            self.assertEqual(source.data_ptr(), output[rank * 6 :].data_ptr())
+            expected = torch.full_like(output, -1.0)
+            expected[rank * 6 : (rank + 1) * 6] = torch.cat(inputs)
+            self.assertEqual(output, expected)
 
     @parametrize("failure", ["allocate", "copy_in", "collective"])
     def test_failed_gather_releases_output(self, failure):
@@ -2543,14 +2523,7 @@ class TestAllGatherLayouts(TestCase):
         self.assertEqual(len(released), 0 if failure == "allocate" else 2)
 
     def test_reset_pending_post_forward_release_is_idempotent(self):
-        group = FSDPParamGroup.__new__(FSDPParamGroup)
-        group._sharded_state = ShardedState.SHARDED_POST_FORWARD
-        group.fsdp_params = []
-        group.device_handle = MagicMock()
-        group.comm_ctx = MagicMock()
-        group._post_reduce_event = group._all_reduce_state = None
-        group._reshard_after_forward_event = None
-        group._post_forward_indices = []
+        group = self._make_param_group(state=ShardedState.SHARDED_POST_FORWARD)
         group._all_gather_result = AllGatherResult(
             torch.empty(0), None, None, [], [], []
         )
@@ -2583,19 +2556,10 @@ class TestAllGatherLayouts(TestCase):
                 order.append("wait")
                 return True
 
-        group = FSDPParamGroup.__new__(FSDPParamGroup)
-        group._sharded_state = ShardedState.SHARDED
-        group.fsdp_params = []
-        group.device_handle = MagicMock()
-        group.comm_ctx = MagicMock()
-        group.comm_ctx._last_post_reduce_events = {}
-        group._post_reduce_event = group._all_reduce_state = None
-        group._reshard_after_forward_event = None
-        group._post_forward_indices = []
+        group = self._make_param_group()
         group._all_gather_result = AllGatherResult(
             output, None, DeferredWork(), [[torch.float32]], [[2]], [2]
         )
-        group._all_gather_comm = MagicMock(spec=AllGather)
         group._all_gather_comm.release_output.side_effect = lambda: order.append(
             "release"
         )
@@ -2608,10 +2572,9 @@ class TestAllGatherLayouts(TestCase):
 
     @parametrize("post_forward", [False, True])
     def test_reshard_releases_output_after_parameter_transition(self, post_forward):
-        group = FSDPParamGroup.__new__(FSDPParamGroup)
-        group._sharded_state = ShardedState.UNSHARDED
-        group._all_gather_comm = MagicMock(spec=AllGather)
-        group.fsdp_params = [MagicMock(), MagicMock()]
+        group = self._make_param_group(
+            state=ShardedState.UNSHARDED, params=[MagicMock(), MagicMock()]
+        )
         order = []
         method = "to_sharded_post_forward" if post_forward else "to_sharded"
         for param in group.fsdp_params:
@@ -2628,9 +2591,6 @@ class TestAllGatherLayouts(TestCase):
 
     def test_deferred_work_write_preserves_saved_parameter_versions(self):
         param = self._make_param()
-        param.fsdp_placement = SimpleNamespace(dim=0)
-        param.padded_sharded_param_size = torch.Size([2])
-        param.sharded_state = ShardedState.SHARDED
         output = torch.arange(1.0, 5.0)
         _init_layout_outputs([param], AllGatherOutputs([[output]], True))
         param.init_unsharded_param()
@@ -2650,37 +2610,9 @@ class TestAllGatherLayouts(TestCase):
         loss.backward()
         self.assertEqual(param._unsharded_param.grad, torch.arange(2.0, 9.0, 2.0))
 
-    @parametrize("eligible", [False, True])
-    def test_default_layout_contract(self, eligible):
-        layout = DefaultAllGatherLayout()
-        layout._bind_owner(object())
-        layout._bind_owner(object())
-        self.assertIs(DefaultAllGather().layout, DEFAULT_ALL_GATHER_LAYOUT)
-
-        comm = MagicMock(spec=AllGather)
-        comm.layout = DEFAULT_ALL_GATHER_LAYOUT
-        comm.allocate.return_value = torch.empty(4)
-        group = MagicMock()
-        group.size.return_value = 2
-        group.rank.return_value = 0
-        with (
-            patch(
-                "torch.distributed.fsdp._fully_shard._fsdp_collectives._get_param_all_gather_inputs",
-                return_value=[[torch.arange(2.0)]],
-            ),
-            patch(
-                "torch.distributed.fsdp._fully_shard._fsdp_collectives._can_use_param_contiguous_output",
-                return_value=eligible,
-            ),
-        ):
-            result = _default_all_gather_input_fn(
-                [MagicMock()], group, torch.device("cpu"), comm
-            )
-        self.assertIs(result.layout, DEFAULT_ALL_GATHER_LAYOUT)
-
     @parametrize("reshard_after_forward", [True, False, 2])
     def test_reshard_keeps_native_event_policy(self, reshard_after_forward):
-        group = FSDPParamGroup.__new__(FSDPParamGroup)
+        group = self._make_param_group()
         group._training_state = TrainingState.FORWARD
         group.mesh_info = object()
         group.post_forward_mesh_info = (
@@ -2688,10 +2620,8 @@ class TestAllGatherLayouts(TestCase):
         )
         if type(reshard_after_forward) is int:
             group.post_forward_mesh_info = object()
-        group.device_handle = MagicMock()
         group._to_sharded = MagicMock()
         group._to_sharded_post_forward = MagicMock()
-        group._reshard_after_forward_event = None
         group.reshard()
         if type(reshard_after_forward) is int:
             group._to_sharded_post_forward.assert_called_once()
@@ -2699,8 +2629,6 @@ class TestAllGatherLayouts(TestCase):
             group.device_handle.Event.assert_called_once()
             group._reshard_after_forward_event.record.assert_called_once()
             event = group._reshard_after_forward_event
-            group._all_gather_result = None
-            group._sharded_state = ShardedState.SHARDED
             group.unshard_in_backward = True
             group.mesh_info = object()
             group._all_gather_output = torch.empty(0)
@@ -2727,10 +2655,7 @@ class TestAllGatherLayouts(TestCase):
         for index, param in enumerate(params):
             param.param_dtype = None
             param.offload_to_cpu = False
-            param.sharded_state = ShardedState.SHARDED
             param._sharded_param_data = torch.tensor([1.0, 2.0]) + 2 * index
-            param.fsdp_placement = SimpleNamespace(dim=0)
-            param.padded_sharded_param_size = torch.Size([2])
             param.is_dtensor = False
         layout = _ZeroCopyThenFallbackLayout()
 
@@ -2791,12 +2716,9 @@ class TestAllGatherLayouts(TestCase):
             input_refs.append(weakref.ref(tensor))
             return AllGatherInput(tensor, torch.empty(8), [[torch.float32]], [[4]], [4])
 
-        class TestAllGather(AllGather):
+        class TestAllGather(_RankMajorTestAllGather):
             def __call__(self, output_tensor, input_tensor, group, async_op=False):
                 output_tensor.copy_(input_tensor.repeat(group.size()))
-
-            def allocate(self, size, *, dtype, device):
-                return torch.empty(size, dtype=dtype, device=device)
 
         group = MagicMock()
         group.size.return_value = 2
@@ -2829,24 +2751,13 @@ class TestAllGatherLayouts(TestCase):
         param = self._make_param()
         param.fsdp_placement = SimpleNamespace(dim=1)
         param.padded_sharded_param_size = torch.Size([2, 3])
-        param.sharded_state = ShardedState.SHARDED
         ranks = [torch.arange(6.0).view(2, 3) + rank * 10 for rank in range(2)]
         source = torch.cat(ranks).flatten()
         work = MagicMock(spec=dist.Work)
         event = object()
         layout = DefaultAllGatherLayout() if fresh_layout else DEFAULT_ALL_GATHER_LAYOUT
-        _, layout, output_metadata = layout.prepare(
-            AllGatherInputMetadata(
-                input_split_sizes=[6],
-                input_numel=6,
-                world_size=2,
-                dtype=torch.float32,
-                device=torch.device("cpu"),
-                can_use_param_contiguous_output=False,
-            )
-        )
         result = AllGatherResult(
-            source, event, work, [[torch.float32]], [[6]], [6], layout, output_metadata
+            source, event, work, [[torch.float32]], [[6]], [6], layout
         )
         handle = MagicMock()
         order = []
@@ -2864,13 +2775,20 @@ class TestAllGatherLayouts(TestCase):
 
         group = MagicMock()
         group.size.return_value = 2
-        with patch(
-            "torch.distributed.fsdp._fully_shard._fsdp_collectives._get_device_handle",
-            return_value=handle,
+        with (
+            patch(
+                "torch.distributed.fsdp._fully_shard._fsdp_collectives._get_device_handle",
+                return_value=handle,
+            ),
+            patch.object(
+                layout, "finalize_outputs", wraps=layout.finalize_outputs
+            ) as finalize,
         ):
             foreach_all_gather_copy_out(
                 result, [param], group, all_gather_output_fn=output_callback
             )
+        if output_hook == "default":
+            finalize.assert_called_once()
         self.assertEqual(
             param.all_gather_outputs[0].view(2, 6), torch.cat(ranks, dim=1)
         )
@@ -2937,8 +2855,25 @@ class TestAllGatherLayouts(TestCase):
                 self.assertIs(old, new)
 
     @staticmethod
+    def _make_param_group(*, state=ShardedState.SHARDED, params=()):
+        group = FSDPParamGroup.__new__(FSDPParamGroup)
+        group._sharded_state = state
+        group.fsdp_params = list(params)
+        group.device_handle = MagicMock()
+        group.comm_ctx = MagicMock(_last_post_reduce_events={})
+        group._post_reduce_event = group._all_reduce_state = None
+        group._reshard_after_forward_event = None
+        group._post_forward_indices = []
+        group._all_gather_result = None
+        group._all_gather_comm = MagicMock(spec=AllGather)
+        return group
+
+    @staticmethod
     def _make_param():
         param = FSDPParam.__new__(FSDPParam)
+        param.fsdp_placement = SimpleNamespace(dim=0)
+        param.padded_sharded_param_size = torch.Size([2])
+        param.sharded_state = ShardedState.SHARDED
         param.all_gather_outputs = []
         param._unsharded_param = None
         param._keep_all_gather_output_storage = False
@@ -3061,6 +2996,7 @@ class TestParamContiguousEligibility(TestCase):
             layout._bind_owner(object())
 
     def test_stateless_default_layout_can_be_shared(self):
+        self.assertIs(DefaultAllGather().layout, DEFAULT_ALL_GATHER_LAYOUT)
         layout = DefaultAllGatherLayout()
         layout._bind_owner(object())
         layout._bind_owner(object())
