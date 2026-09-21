@@ -546,12 +546,20 @@ def _default_all_gather_output_fn(
             all_gather_result.param_all_gather_input_dtypes,
         )
     ]
-    outputs = all_gather_result.layout.finalize_outputs(
-        all_gather_result.all_gather_output,
-        param_metadata,
-        world_size,
-        all_gather_result.output_metadata,
+    # Custom finalizers may copy into outputs that alias saved parameters.
+    preserved_outputs = tuple(
+        output
+        for param in param_metadata
+        for output in param.outputs
+        if not output.is_inference()
     )
+    with torch.autograd._unsafe_preserve_version_counter(preserved_outputs):
+        outputs = all_gather_result.layout.finalize_outputs(
+            all_gather_result.all_gather_output,
+            param_metadata,
+            world_size,
+            all_gather_result.output_metadata,
+        )
     _init_layout_outputs(fsdp_params, outputs)
 
 
